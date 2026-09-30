@@ -20,6 +20,77 @@ export interface CPSourceSearchResult {
   confidenceScore: number;
 }
 
+function matchesSubject(target: string, item: string): { matches: boolean; score: number } {
+  const t = target.trim().toLowerCase();
+  const i = item.trim().toLowerCase();
+
+  if (!t || !i) {
+    return { matches: false, score: 0 };
+  }
+
+  // Exact match
+  if (t === i) {
+    return { matches: true, score: 50 };
+  }
+
+  // PJOK aliases
+  const isTargetPJOK = t.includes('pjok') || t.includes('jasmani') || t.includes('penjas');
+  const isItemPJOK = i.includes('pjok') || i.includes('jasmani') || i.includes('penjas');
+  if (isTargetPJOK || isItemPJOK) {
+    if (isTargetPJOK && isItemPJOK) {
+      return { matches: true, score: 45 };
+    }
+    return { matches: false, score: 0 };
+  }
+
+  // Bahasa Indonesia aliases
+  const isTargetBI = t.includes('bahasa indonesia') || t.includes('b. indonesia') || t.includes('b.indo');
+  const isItemBI = i.includes('bahasa indonesia') || i.includes('b. indonesia') || i.includes('b.indo');
+  if (isTargetBI || isItemBI) {
+    if (isTargetBI && isItemBI) {
+      return { matches: true, score: 45 };
+    }
+    return { matches: false, score: 0 };
+  }
+
+  // IPAS aliases
+  const isTargetIPAS = t.includes('ipas') || t.includes('ilmu pengetahuan alam dan sosial') || t.includes('ilmu pengetahuan alam & sosial');
+  const isItemIPAS = i.includes('ipas') || i.includes('ilmu pengetahuan alam dan sosial') || i.includes('ilmu pengetahuan alam & sosial');
+  if (isTargetIPAS || isItemIPAS) {
+    if (isTargetIPAS && isItemIPAS) {
+      return { matches: true, score: 45 };
+    }
+    return { matches: false, score: 0 };
+  }
+
+  // Matematika aliases
+  const isTargetMat = t.includes('matematika') || t.includes('mtk') || t === 'math';
+  const isItemMat = i.includes('matematika') || i.includes('mtk');
+  if (isTargetMat || isItemMat) {
+    if (isTargetMat && isItemMat) {
+      return { matches: true, score: 45 };
+    }
+    return { matches: false, score: 0 };
+  }
+
+  // Pendidikan Pancasila aliases
+  const isTargetPancasila = t.includes('pancasila') || t.includes('ppkn') || t.includes('pkn');
+  const isItemPancasila = i.includes('pancasila') || i.includes('ppkn') || i.includes('pkn');
+  if (isTargetPancasila || isItemPancasila) {
+    if (isTargetPancasila && isItemPancasila) {
+      return { matches: true, score: 45 };
+    }
+    return { matches: false, score: 0 };
+  }
+
+  // Substring match for other subjects (minimum 3 characters to avoid trivial substring collisions)
+  if (t.length >= 3 && (i.includes(t) || t.includes(i))) {
+    return { matches: true, score: 35 };
+  }
+
+  return { matches: false, score: 0 };
+}
+
 /**
  * Official CP Source Repository & Registry
  * Prioritizes official government publications (Kemendikdasmen, BSKAP, Ruang GTK).
@@ -30,87 +101,77 @@ class CPSourceRepository {
 
   /**
    * Search available CP entries by ActiveContext
+   * Uses subject as a HARD FILTER: candidates of other subjects are never included.
    */
   public search(context: Partial<ActiveContext>): CPSourceSearchResult[] {
-    const targetSubject = (context.subject || '').trim().toLowerCase();
+    const rawTargetSubject = context.subject || '';
+    const targetSubject = rawTargetSubject.trim().toLowerCase();
+    if (!targetSubject) {
+      return [];
+    }
+
     const targetLevel = (context.level || '').trim().toLowerCase();
     const targetPhase = (context.phase || '').trim().toLowerCase();
     const targetGrade = (context.grade || '').trim().toLowerCase();
 
-    return this.registry
-      .map((item, index) => {
-        let score = 0;
-        const itemSubject = item.subject.toLowerCase();
-        const itemPhase = item.phase.toLowerCase();
-        const itemLevel = item.level.toLowerCase();
+    const matchedResults: CPSourceSearchResult[] = [];
 
-        // Exact or fuzzy subject match
-        if (itemSubject === targetSubject) {
-          score += 50;
-        } else if (
-          (targetSubject.includes('pjok') || targetSubject.includes('jasmani')) &&
-          itemSubject.includes('pjok')
-        ) {
-          score += 45;
-        } else if (
-          targetSubject.includes('bahasa indonesia') &&
-          itemSubject.includes('bahasa indonesia')
-        ) {
-          score += 45;
-        } else if (
-          targetSubject.includes('ipas') &&
-          itemSubject.includes('ipas')
-        ) {
-          score += 45;
-        } else if (
-          targetSubject.includes('matematika') &&
-          itemSubject.includes('matematika')
-        ) {
-          score += 45;
-        } else if (
-          targetSubject.includes('pancasila') &&
-          itemSubject.includes('pancasila')
-        ) {
-          score += 45;
-        } else if (itemSubject.includes(targetSubject) || targetSubject.includes(itemSubject)) {
-          score += 30;
-        }
+    this.registry.forEach((item, index) => {
+      // 1. HARD FILTER on subject: only matching subjects are permitted
+      const subjectMatch = matchesSubject(targetSubject, item.subject);
+      if (!subjectMatch.matches) {
+        return;
+      }
 
-        // Phase match
-        if (targetPhase && itemPhase === targetPhase) {
-          score += 30;
-        }
+      let score = subjectMatch.score;
+      const itemPhase = item.phase.toLowerCase();
+      const itemLevel = item.level.toLowerCase();
+      const itemGrade = item.grade.toLowerCase();
 
-        // Level match
-        if (targetLevel && itemLevel === targetLevel) {
-          score += 20;
-        }
+      // 2. Phase match
+      if (targetPhase && itemPhase === targetPhase) {
+        score += 30;
+      } else if (targetPhase && (itemPhase.includes(targetPhase) || targetPhase.includes(itemPhase))) {
+        score += 20;
+      }
 
-        return {
-          id: `src-${index + 1}`,
-          subject: item.subject,
-          level: item.level,
-          grade: item.grade,
-          phase: item.phase,
-          curriculum: 'Kurikulum Merdeka',
-          title: item.sourceInfo.title,
-          institution: item.sourceInfo.institution,
-          documentYear: item.sourceInfo.documentYear || '2024/2025',
-          url: item.sourceInfo.url,
-          page: item.sourceInfo.page,
-          verificationStatus: normalizeCPVerificationStatus(item.sourceInfo.verificationStatus),
-          generalDescription: item.generalDescription,
-          elements: item.elements.map((el, elIdx) => ({
-            id: `elem-${index + 1}-${elIdx + 1}`,
-            name: el.name,
-            content: el.content,
-          })),
-          sourceMeta: item.sourceInfo,
-          confidenceScore: score,
-        };
-      })
-      .filter((r) => r.confidenceScore > 20)
-      .sort((a, b) => b.confidenceScore - a.confidenceScore);
+      // 3. Level match
+      if (targetLevel && itemLevel === targetLevel) {
+        score += 15;
+      }
+
+      // 4. Grade match
+      if (targetGrade && itemGrade === targetGrade) {
+        score += 10;
+      } else if (targetGrade && (itemGrade.includes(targetGrade) || targetGrade.includes(itemGrade))) {
+        score += 5;
+      }
+
+      matchedResults.push({
+        id: `src-${index + 1}`,
+        subject: item.subject,
+        level: item.level,
+        grade: item.grade,
+        phase: item.phase,
+        curriculum: 'Kurikulum Merdeka',
+        title: item.sourceInfo.title,
+        institution: item.sourceInfo.institution,
+        documentYear: item.sourceInfo.documentYear || '2024/2025',
+        url: item.sourceInfo.url,
+        page: item.sourceInfo.page,
+        verificationStatus: normalizeCPVerificationStatus(item.sourceInfo.verificationStatus),
+        generalDescription: item.generalDescription,
+        elements: item.elements.map((el, elIdx) => ({
+          id: `elem-${index + 1}-${elIdx + 1}`,
+          name: el.name,
+          content: el.content,
+        })),
+        sourceMeta: item.sourceInfo,
+        confidenceScore: score,
+      });
+    });
+
+    return matchedResults.sort((a, b) => b.confidenceScore - a.confidenceScore);
   }
 
   /**
