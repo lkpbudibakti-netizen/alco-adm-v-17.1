@@ -1495,7 +1495,13 @@ ATURAN TARGET ID SANGAT PENTING:
   - 'PASS': Memenuhi standar kualitas dengan baik.
   - 'REVIEW': Terdapat catatan atau saran perbaikan minor yang perlu ditinjau guru.
   - 'FAIL': Terdapat pelanggaran kaidah penulisan fatal yang perlu diganti/diperbaiki.
-- 'reason': Penjelasan singkat dan konstruktif dengan merujuk isi pedagogis (tujuan, materi, atau tingkat kognitif).`;
+- 'reason': Penjelasan singkat dan konstruktif dengan merujuk isi pedagogis (tujuan, materi, atau tingkat kognitif).
+
+ATURAN LINKAGE KANONIKAL EKSPLISIT:
+- Setiap butir soal (item) memiliki relasi kanonikal eksplisit:
+  instrumentItemId → blueprintItemId → coverageUnitId → TP/KKTP/assessmentIndicator → cognitiveDemand
+- Reviewer WAJIB menggunakan linkage ID tersebut (blueprintItemId, coverageUnitId, instrumentId, instrumentItemIds) untuk menentukan blueprint, TP, KKTP, indikator asesmen, dan target kognitif milik setiap item.
+- DILARANG KERAS menebak atau mereka-reka hubungan antara soal dan kisi-kisi berdasarkan kemiripan teks atau asumsi bebas.`;
 
     const objectivesList = generationPlan?.generationSpec?.objectives || [];
     const criteriaList = generationPlan?.generationSpec?.criteria || [];
@@ -1541,6 +1547,8 @@ ATURAN TARGET ID SANGAT PENTING:
         assessmentIndicator,
         materialOrContext,
         instrumentType: bp.instrumentType,
+        instrumentId: bp.instrumentId,
+        instrumentItemIds: bp.instrumentItemIds,
         cognitiveDemand: bp.cognitiveDemand,
         difficultyTarget: bp.difficultyTarget,
       };
@@ -1551,19 +1559,31 @@ ATURAN TARGET ID SANGAT PENTING:
       type: inst.type,
       title: inst.title,
       items: Array.isArray(inst.items)
-        ? inst.items.map((it: any) => ({
-            id: it.id,
-            itemType: it.itemType,
-            prompt: it.prompt,
-            stimulus: it.stimulus,
-            options: it.options ? it.options.map((o: any) => ({ id: o.id, text: o.text, isCorrect: o.isCorrect })) : undefined,
-          }))
+        ? inst.items.map((it: any) => {
+            const bp = assessmentPackage.blueprintItems?.find(
+              (b: any) => b.id === it.blueprintItemId || (Array.isArray(b.instrumentItemIds) && b.instrumentItemIds.includes(it.id))
+            );
+            return {
+              id: it.id,
+              blueprintItemId: it.blueprintItemId || (bp ? bp.id : undefined),
+              coverageUnitId: it.coverageUnitId || (bp ? bp.coverageUnitId : undefined),
+              plannedItemId: it.plannedItemId || undefined,
+              cognitiveDemand: it.cognitiveDemand || (bp ? bp.cognitiveDemand : undefined),
+              difficultyTarget: it.difficultyTarget || (bp ? bp.difficultyTarget : undefined),
+              itemType: it.itemType,
+              prompt: it.prompt,
+              stimulus: it.stimulus,
+              options: it.options ? it.options.map((o: any) => ({ id: o.id, text: o.text, isCorrect: o.isCorrect })) : undefined,
+            };
+          })
         : undefined,
       aspects: inst.aspects,
     }));
 
-    const userPrompt = `Lakukan telaah kualitas untuk perangkat asesmen berikut berdasarkan keterkaitan pedagogis:
-[TP/objective → criterion/KKTP → assessmentIndicator → item → cognitiveDemand]
+    const userPrompt = `Lakukan telaah kualitas untuk perangkat asesmen berikut berdasarkan linkage kanonikal eksplisit:
+[instrumentItemId → blueprintItemId → coverageUnitId → TP/KKTP/assessmentIndicator → cognitiveDemand]
+
+Gunakan linkage ID tersebut secara ketat untuk menelaah keselarasan materi (CONTENT_ALIGNMENT) dan kognitif (COGNITIVE_ALIGNMENT) setiap butir soal terhadap TP, KKTP, indikator, dan cognitiveDemand yang telah dipetakan, TANPA menebak berdasarkan kemiripan teks.
 
 Judul Perangkat: ${assessmentPackage.title || '-'}
 Kalibrasi Kelas: ${JSON.stringify(gradeCalibration || {}, null, 2)}
