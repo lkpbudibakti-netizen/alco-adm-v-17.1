@@ -53,6 +53,8 @@ import {
   CategoryResponseStatement,
   CategoryResponseCategory,
   AssessmentRegenerationTarget,
+  AssessmentAnswerVerificationProvider,
+  AssessmentQualityReviewProvider,
 } from '../../types';
 import {
   createEmptyAssessmentPackage,
@@ -439,12 +441,46 @@ export const AssessmentPackageBuilder: React.FC<AssessmentPackageBuilderProps> =
         generationSpec: spec,
       });
 
+      const answerVerificationProvider: AssessmentAnswerVerificationProvider = {
+        verify: async (request) => {
+          const res = await aiFetch('/api/ai/verify-assessment-answers', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(request),
+          });
+          if (!res.ok) {
+            const errData = await res.json().catch(() => ({}));
+            throw new Error(errData.error || `Gagal verifikasi jawaban via AI (Status ${res.status})`);
+          }
+          const data = await res.json();
+          return data.data;
+        },
+      };
+
+      const qualityReviewProvider: AssessmentQualityReviewProvider = {
+        review: async (request) => {
+          const res = await aiFetch('/api/ai/review-assessment-quality', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(request),
+          });
+          if (!res.ok) {
+            const errData = await res.json().catch(() => ({}));
+            throw new Error(errData.error || `Gagal review kualitas asesmen via AI (Status ${res.status})`);
+          }
+          const data = await res.json();
+          return data.data;
+        },
+      };
+
       const report = await validateGeneratedAssessment({
         assessmentPackage: activePackage,
         generationPlan: genPlan,
         validationContext,
         gradeCalibration: spec.generationProfile?.gradeCalibration,
         subjectProfile: spec.subjectProfile,
+        answerVerificationProvider,
+        qualityReviewProvider,
       });
 
       setValidationReport(report);

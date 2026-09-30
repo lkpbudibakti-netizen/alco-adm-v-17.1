@@ -1357,6 +1357,235 @@ Hasilkan pembaruan untuk editableContent tersebut dalam format JSON.`;
   return res.status(500).json({ error: 'Gagal meregenerasi target asesmen' });
 });
 
+// 4. Endpoint: AI Assessment Answer Key Verification (9C.5 / 9C.7)
+app.post('/api/ai/verify-assessment-answers', async (req, res) => {
+  const { assessmentPackage, itemsToVerify } = req.body || {};
+  if (!itemsToVerify || !Array.isArray(itemsToVerify) || itemsToVerify.length === 0) {
+    return res.json({ success: true, data: { results: [] } });
+  }
+
+  const apiKey = resolveApiKey(req);
+  if (!apiKey) {
+    return res.status(503).json({
+      success: false,
+      code: 'AI_NOT_CONFIGURED',
+      error: 'Layanan AI belum dikonfigurasi pada server.',
+    });
+  }
+
+  try {
+    const ai = createAIClient(apiKey);
+    const systemInstruction = `Anda adalah Verifikator Kunci Jawaban Asesmen (AI Answer Verifier) profesional di Indonesia.
+Tugas Anda adalah memverifikasi kebenaran dan ketepatan semantik kunci jawaban untuk butir-butir soal yang diberikan.
+
+Pedoman evaluasi status:
+- 'VERIFIED': Kunci jawaban terbukti benar, tepat, dan tidak memiliki ambiguitas berdasarkan pertanyaan dan opsi/pasangan.
+- 'REJECTED': Kunci jawaban terbukti SALAH secara faktual/konseptual, opsi yang ditandai benar keliru, atau pasangan menjodohkan salah.
+- 'REVIEW': Terdapat ambiguitas soal, ada lebih dari satu opsi yang bisa dianggap benar, teks kunci jawaban mengandung salah ketik fatal, atau butir memerlukan penilaian subjektif guru.
+
+Wajib sertakan alasan ringkas dan jelas pada 'reason'.
+Kembalikan HANYA format JSON sesuai schema.`;
+
+    const promptData = itemsToVerify.map((item: any, idx: number) => ({
+      index: idx + 1,
+      instrumentItemId: item.instrumentItemId,
+      itemType: item.itemType,
+      prompt: item.prompt,
+      stimulus: item.stimulus || undefined,
+      options: item.options || undefined,
+      premises: item.premises || undefined,
+      responses: item.responses || undefined,
+      categories: item.categories || undefined,
+      proposedAnswerKey: item.proposedAnswerKey || undefined,
+    }));
+
+    const userPrompt = `Verifikasi kebenaran kunci jawaban untuk ${itemsToVerify.length} butir soal berikut:
+${JSON.stringify(promptData, null, 2)}
+
+Kembalikan hasil verifikasi untuk SETIAP instrumentItemId di atas dalam array results.`;
+
+    const verifyAnswersResponseSchema = {
+      type: Type.OBJECT,
+      properties: {
+        results: {
+          type: Type.ARRAY,
+          items: {
+            type: Type.OBJECT,
+            properties: {
+              instrumentItemId: { type: Type.STRING },
+              status: { type: Type.STRING, enum: ['VERIFIED', 'REVIEW', 'REJECTED'] },
+              reason: { type: Type.STRING },
+            },
+            required: ['instrumentItemId', 'status', 'reason'],
+          },
+        },
+      },
+      required: ['results'],
+    };
+
+    const response = await generateContentWithRetry(ai, {
+      contents: userPrompt,
+      config: {
+        systemInstruction,
+        responseMimeType: 'application/json',
+        responseSchema: verifyAnswersResponseSchema,
+      },
+    });
+
+    if (response.text) {
+      const parsed = cleanAndParseJSON(response.text, null);
+      if (parsed && Array.isArray(parsed.results)) {
+        return res.json({ success: true, data: parsed });
+      }
+    }
+    return res.status(500).json({ error: 'Gagal parse JSON hasil verifikasi jawaban AI' });
+  } catch (error: any) {
+    console.error('Gemini verify assessment answers failed:', error);
+    const isAuth = error?.status === 401 || error?.status === 403;
+    return res.status(isAuth ? error.status : 500).json({ error: error.message || 'Gagal verifikasi jawaban via Gemini' });
+  }
+});
+
+// 5. Endpoint: AI Assessment Quality Review (9C.5 / 9C.7)
+app.post('/api/ai/review-assessment-quality', async (req, res) => {
+  const { assessmentPackage, generationPlan, gradeCalibration, subjectProfile } = req.body || {};
+  if (!assessmentPackage) {
+    return res.status(400).json({ error: 'Assessment package is required' });
+  }
+
+  const apiKey = resolveApiKey(req);
+  if (!apiKey) {
+    return res.status(503).json({
+      success: false,
+      code: 'AI_NOT_CONFIGURED',
+      error: 'Layanan AI belum dikonfigurasi pada server.',
+    });
+  }
+
+  try {
+    const ai = createAIClient(apiKey);
+    const systemInstruction = `Anda adalah AI Quality Reviewer profesional untuk kurikulum dan perangkat asesmen di Indonesia.
+Tugas Anda adalah menelaah kualitas butir dan instrumen asesmen yang dirancang.
+
+Dimensi evaluasi kualitas:
+1. CONTENT_ALIGNMENT: Keselarasan materi butir dengan tujuan pembelajaran / materi kurikulum.
+2. COGNITIVE_ALIGNMENT: Keselarasan tingkat kognitif butir dengan target kognitif.
+3. ITEM_CONSTRUCTION: Kualitas konstruksi butir soal (kejelasan pokok soal, tidak ambigu, tidak memberi petunjuk jawaban).
+4. STIMULUS_QUALITY: Kualitas dan relevansi stimulus (jika ada stimulus).
+5. ANSWER_VERIFICATION: Kepastian kunci jawaban dan objektivitas penskoran.
+6. DISTRACTOR_QUALITY: Kualitas pilihan pengecoh (hanya untuk butir yang memiliki opsi pilihan ganda).
+7. GRADE_LANGUAGE: Kesesuaian bahasa, keterbacaan, dan istilah dengan fase/tingkat kelas murid.
+8. SENSITIVITY: Bebas dari bias SARA, diskriminasi gender, politik praktis, atau kekerasan.
+9. TRACEABILITY: Keterlacakan pemetaan butir ke kisi-kisi asesmen.
+10. DUPLICATION: Tidak ada pengulangan atau duplikasi butir soal.
+
+ATURAN TARGET ID SANGAT PENTING:
+- Setiap finding untuk butir soal WAJIB menyertakan 'instrumentItemId' yang SAMA PERSIS dengan ID butir soal yang dievaluasi.
+- Jika mengevaluasi kisi-kisi atau cakupan umum, gunakan 'coverageUnitId' atau 'unitId' yang ada di data.
+- 'DISTRACTOR_QUALITY' HANYA boleh diterapkan pada butir pilihan ganda yang memiliki opsi jawaban.
+- Status:
+  - 'PASS': Memenuhi standar kualitas dengan baik.
+  - 'REVIEW': Terdapat catatan atau saran perbaikan minor yang perlu ditinjau guru.
+  - 'FAIL': Terdapat pelanggaran kaidah penulisan fatal yang perlu diganti/diperbaiki.
+- 'reason': Penjelasan singkat dan konstruktif.`;
+
+    const compactBlueprint = (assessmentPackage.blueprintItems || []).map((bp: any) => ({
+      id: bp.id,
+      coverageUnitId: bp.coverageUnitId,
+      objectiveRefId: bp.objectiveRefId,
+      instrumentType: bp.instrumentType,
+      cognitiveDemand: bp.cognitiveDemand,
+      difficultyTarget: bp.difficultyTarget,
+    }));
+
+    const compactInstruments = (assessmentPackage.instruments || []).map((inst: any) => ({
+      id: inst.id,
+      type: inst.type,
+      title: inst.title,
+      items: Array.isArray(inst.items)
+        ? inst.items.map((it: any) => ({
+            id: it.id,
+            itemType: it.itemType,
+            prompt: it.prompt,
+            stimulus: it.stimulus,
+            options: it.options ? it.options.map((o: any) => ({ id: o.id, text: o.text, isCorrect: o.isCorrect })) : undefined,
+          }))
+        : undefined,
+      aspects: inst.aspects,
+    }));
+
+    const userPrompt = `Lakukan telaah kualitas untuk perangkat asesmen berikut:
+Judul: ${assessmentPackage.title || '-'}
+Kalibrasi Kelas: ${JSON.stringify(gradeCalibration || {}, null, 2)}
+Profil Subjek: ${JSON.stringify(subjectProfile || {}, null, 2)}
+
+Kisi-Kisi (Blueprint):
+${JSON.stringify(compactBlueprint, null, 2)}
+
+Instrumen & Butir Soal:
+${JSON.stringify(compactInstruments, null, 2)}
+
+Berikan evaluasi kualitas untuk butir-butir soal dan instrumen tersebut dalam format JSON sesuai schema.`;
+
+    const qualityReviewResponseSchema = {
+      type: Type.OBJECT,
+      properties: {
+        findings: {
+          type: Type.ARRAY,
+          items: {
+            type: Type.OBJECT,
+            properties: {
+              dimension: {
+                type: Type.STRING,
+                enum: [
+                  'CONTENT_ALIGNMENT',
+                  'COGNITIVE_ALIGNMENT',
+                  'ITEM_CONSTRUCTION',
+                  'STIMULUS_QUALITY',
+                  'ANSWER_VERIFICATION',
+                  'DISTRACTOR_QUALITY',
+                  'GRADE_LANGUAGE',
+                  'SENSITIVITY',
+                  'TRACEABILITY',
+                  'DUPLICATION',
+                ],
+              },
+              status: { type: Type.STRING, enum: ['PASS', 'REVIEW', 'FAIL'] },
+              reason: { type: Type.STRING },
+              unitId: { type: Type.STRING },
+              instrumentItemId: { type: Type.STRING },
+              coverageUnitId: { type: Type.STRING },
+            },
+            required: ['dimension', 'status', 'reason'],
+          },
+        },
+      },
+      required: ['findings'],
+    };
+
+    const response = await generateContentWithRetry(ai, {
+      contents: userPrompt,
+      config: {
+        systemInstruction,
+        responseMimeType: 'application/json',
+        responseSchema: qualityReviewResponseSchema,
+      },
+    });
+
+    if (response.text) {
+      const parsed = cleanAndParseJSON(response.text, null);
+      if (parsed && Array.isArray(parsed.findings)) {
+        return res.json({ success: true, data: parsed });
+      }
+    }
+    return res.status(500).json({ error: 'Gagal parse JSON hasil telaah kualitas AI' });
+  } catch (error: any) {
+    console.error('Gemini review assessment quality failed:', error);
+    const isAuth = error?.status === 401 || error?.status === 403;
+    return res.status(isAuth ? error.status : 500).json({ error: error.message || 'Gagal telaah kualitas via Gemini' });
+  }
+});
+
 // Final /api 404 handler - must return JSON and never fall through to Vite static HTML fallback
 app.all('/api/*', (req, res) => {
   res.status(404).json({
