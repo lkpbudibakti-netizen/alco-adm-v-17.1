@@ -1,0 +1,8 @@
+{
+  "name": "alco-adm-v17.1",
+  "description": "Imported from GitHub",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}

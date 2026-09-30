@@ -1,0 +1,3741 @@
+import assert from 'node:assert';
+import fs from 'node:fs';
+import path from 'node:path';
+import { jsPDF } from 'jspdf';
+import {
+  GroundedCalendarSearchProvider,
+  GroundedSearchResponse,
+  isOfficialCalendarSourceUrl,
+  isCandidateBackedByGrounding,
+  extractGroundedWebSources,
+  parseCalendarSearchResponse,
+  buildCalendarSearchPrompt,
+  TrustedCalendarSearchProvider,
+  verifySourceContentRelevance,
+  generateDeterministicOfficialUrls,
+  generateOfficialSeedRoots,
+  extractOfficialLinksFromHtml,
+  isDateSupportedBySource,
+  extractTextFromPdfBuffer,
+  isEventNameSupportedBySource,
+  deriveEventCategoryFromEvidence,
+  readBoundedStream,
+  defaultSourceContentFetcher,
+} from '../server/calendarProvider';
+import {
+  CalendarSearchRequest,
+  CalendarSourceCandidate,
+  isSafeCalendarSourceUrl,
+  selectBestCalendarSource,
+  buildNationalBaseCandidate,
+  isUsableCalendarCandidate,
+  evaluateCalendarCandidate,
+} from '../src/services/calendarProvider';
+import {
+  projectCandidateEventsToCalendarDays,
+  projectNationalBaseToSemesterDraft,
+  generateEffectiveCalendarDays,
+  confirmCalendarWorkflow,
+} from '../src/services/calendarResolver';
+import { OFFICIAL_NATIONAL_HOLIDAYS } from '../src/data/calendar/nationalHolidays';
+import { resolvePlanningBaseline } from '../src/data/calendar/planningBaselines';
+import { calculateEffectiveDays, calculateEffectiveWeeks } from '../src/services/jpEngine';
+
+console.log('=== RUNNING AUDIT: BACKEND CALENDAR ONLINE SEARCH PROVIDER ===\n');
+
+let totalTests = 0;
+let passedTests = 0;
+
+async function runTest(name: string, fn: () => void | Promise<void>) {
+  totalTests++;
+  try {
+    await fn();
+    console.log(`[PASS] ${totalTests}. ${name}`);
+    passedTests++;
+  } catch (err: any) {
+    console.error(`[FAIL] ${totalTests}. ${name}:`, err.message);
+    throw err;
+  }
+}
+
+async function main() {
+  // =========================================================================
+  // TEST A: Search hierarchy short-circuits at REGENCY if valid
+  // =========================================================================
+  await runTest('A. Search hierarchy: REGENCY hit short-circuits without querying PROVINCE or NATIONAL', async () => {
+    let regencyCalled = 0;
+    let provinceCalled = 0;
+    let nationalCalled = 0;
+
+    const fakeGenerate = async (prompt: string): Promise<GroundedSearchResponse> => {
+      if (prompt.includes('Kabupaten/Kota')) {
+        regencyCalled++;
+        return {
+          text: JSON.stringify([
+            {
+              province: 'Jawa Barat',
+              regency: 'Kabupaten Bandung',
+              academicYear: '2026/2027',
+              authority: 'Dinas Pendidikan Kabupaten Bandung',
+              documentTitle: 'Pedoman Kaldik Kab Bandung 2026/2027',
+              sourceUrl: 'https://disdik.bandungkab.go.id/kaldik-2026',
+              semesterStartDate: '2026-07-13',
+              semesterEndDate: '2026-12-18',
+            },
+          ]),
+          candidates: [
+            {
+              groundingMetadata: {
+                groundingChunks: [
+                  {
+                    web: {
+                      uri: 'https://disdik.bandungkab.go.id/kaldik-2026',
+                      title: 'Disdik Kab Bandung Kaldik',
+                    },
+                  },
+                ],
+              },
+            },
+          ],
+        };
+      }
+      if (prompt.includes('tingkat Provinsi')) {
+        provinceCalled++;
+        return { text: '[]' };
+      }
+      nationalCalled++;
+      return { text: '[]' };
+    };
+
+    const provider = new GroundedCalendarSearchProvider({
+      generateGroundedContent: fakeGenerate,
+    });
+
+    const results = await provider.search({
+      academicYear: '2026/2027',
+      province: 'Jawa Barat',
+      regency: 'Kabupaten Bandung',
+    });
+
+    assert.strictEqual(results.length, 1);
+    assert.strictEqual(results[0].sourceLevel, 'REGENCY');
+    assert.strictEqual(results[0].regency, 'Kabupaten Bandung');
+    assert.strictEqual(regencyCalled, 1, 'REGENCY must be called once');
+    assert.strictEqual(provinceCalled, 0, 'PROVINCE must not be called after REGENCY hit');
+    assert.strictEqual(nationalCalled, 0, 'NATIONAL must not be called after REGENCY hit');
+  });
+
+  // =========================================================================
+  // TEST B: Province fallback when REGENCY is empty
+  // =========================================================================
+  await runTest('B. Province fallback: REGENCY empty falls back to PROVINCE and short-circuits before NATIONAL', async () => {
+    let regencyCalled = 0;
+    let provinceCalled = 0;
+    let nationalCalled = 0;
+
+    const fakeGenerate = async (prompt: string): Promise<GroundedSearchResponse> => {
+      if (prompt.includes('Kabupaten/Kota')) {
+        regencyCalled++;
+        return { text: '[]' }; // empty at regency
+      }
+      if (prompt.includes('tingkat Provinsi')) {
+        provinceCalled++;
+        return {
+          text: JSON.stringify([
+            {
+              province: 'Jawa Barat',
+              academicYear: '2026/2027',
+              authority: 'Dinas Pendidikan Provinsi Jawa Barat',
+              documentTitle: 'Kaldik Jabar 2026/2027',
+              sourceUrl: 'https://disdik.jabarprov.go.id/kaldik-2026',
+            },
+          ]),
+          candidates: [
+            {
+              groundingMetadata: {
+                groundingChunks: [
+                  {
+                    web: {
+                      uri: 'https://disdik.jabarprov.go.id/kaldik-2026',
+                      title: 'Disdik Jabar',
+                    },
+                  },
+                ],
+              },
+            },
+          ],
+        };
+      }
+      nationalCalled++;
+      return { text: '[]' };
+    };
+
+    const provider = new GroundedCalendarSearchProvider({
+      generateGroundedContent: fakeGenerate,
+    });
+
+    const results = await provider.search({
+      academicYear: '2026/2027',
+      province: 'Jawa Barat',
+      regency: 'Kabupaten Bandung Barat',
+    });
+
+    assert.strictEqual(results.length, 1);
+    assert.strictEqual(results[0].sourceLevel, 'PROVINCE');
+    assert.strictEqual(results[0].province, 'Jawa Barat');
+    assert.strictEqual(regencyCalled, 1);
+    assert.strictEqual(provinceCalled, 1);
+    assert.strictEqual(nationalCalled, 0, 'NATIONAL must not be called after PROVINCE hit');
+  });
+
+  // =========================================================================
+  // TEST C: National fallback when regional searches yield no candidates
+  // =========================================================================
+  await runTest('C. National fallback: Regional empty queries fallback to NATIONAL', async () => {
+    let regencyCalled = 0;
+    let provinceCalled = 0;
+    let nationalCalled = 0;
+
+    const fakeGenerate = async (prompt: string): Promise<GroundedSearchResponse> => {
+      if (prompt.includes('Kabupaten/Kota')) {
+        regencyCalled++;
+        return { text: '[]' };
+      }
+      if (prompt.includes('tingkat Provinsi')) {
+        provinceCalled++;
+        return { text: '[]' };
+      }
+      nationalCalled++;
+      return {
+        text: JSON.stringify([
+          {
+            academicYear: '2026/2027',
+            authority: 'Kementerian Pendidikan Dasar dan Menengah RI',
+            documentTitle: 'Pedoman Standar Kaldik Nasional 2026/2027',
+            sourceUrl: 'https://kemendikdasmen.go.id/pedoman-kaldik-2026',
+          },
+        ]),
+        candidates: [
+          {
+            groundingMetadata: {
+              groundingChunks: [
+                {
+                  web: {
+                    uri: 'https://kemendikdasmen.go.id/pedoman-kaldik-2026',
+                    title: 'Kemendikdasmen Portal',
+                  },
+                },
+              ],
+            },
+          },
+        ],
+      };
+    };
+
+    const provider = new GroundedCalendarSearchProvider({
+      generateGroundedContent: fakeGenerate,
+    });
+
+    const results = await provider.search({
+      academicYear: '2026/2027',
+      province: 'Papua Barat Daya',
+      regency: 'Kabupaten Tambrauw',
+    });
+
+    assert.strictEqual(results.length, 1);
+    assert.strictEqual(results[0].sourceLevel, 'NATIONAL');
+    assert.strictEqual(regencyCalled, 1);
+    assert.strictEqual(provinceCalled, 1);
+    assert.strictEqual(nationalCalled, 1);
+  });
+
+  // =========================================================================
+  // TEST D: Hallucinated URL not backed by grounding is discarded
+  // =========================================================================
+  await runTest('D. Grounding integrity: Hallucinated AI URL without grounding evidence is discarded', () => {
+    const rawJson = JSON.stringify([
+      {
+        province: 'Jawa Barat',
+        regency: 'Kabupaten Bandung',
+        academicYear: '2026/2027',
+        authority: 'Dinas Pendidikan',
+        documentTitle: 'Kaldik',
+        sourceUrl: 'https://disdik.bandungkab.go.id/hallucinated-doc',
+      },
+    ]);
+
+    // Grounding contains completely different domain
+    const groundedSources = [
+      { uri: 'https://other-gov.go.id/article', title: 'Other article' },
+    ];
+
+    const results = parseCalendarSearchResponse(
+      rawJson,
+      'REGENCY',
+      { academicYear: '2026/2027', province: 'Jawa Barat', regency: 'Kabupaten Bandung' },
+      groundedSources
+    );
+
+    assert.strictEqual(results.length, 0, 'Candidate without grounding backing must be discarded');
+  });
+
+  // =========================================================================
+  // TEST E: Non-government source domain is discarded
+  // =========================================================================
+  await runTest('E. Official domain requirement: Non-governmental blogs/sites are discarded', () => {
+    assert.strictEqual(isOfficialCalendarSourceUrl('https://someblog.wordpress.com/kaldik'), false);
+    assert.strictEqual(isOfficialCalendarSourceUrl('https://kaldik-guru.blogspot.com/2026'), false);
+    assert.strictEqual(isOfficialCalendarSourceUrl('https://facebook.com/disdik'), false);
+    assert.strictEqual(isOfficialCalendarSourceUrl('https://drive.google.com/file/d/123'), false);
+    assert.strictEqual(isOfficialCalendarSourceUrl('https://disdik.jabarprov.go.id/kaldik'), true);
+    assert.strictEqual(isOfficialCalendarSourceUrl('https://kemendikdasmen.go.id/dokumen'), true);
+  });
+
+  // =========================================================================
+  // TEST F: HTTP URL is discarded
+  // =========================================================================
+  await runTest('F. HTTPS enforcement: Insecure HTTP URLs are discarded', () => {
+    assert.strictEqual(isOfficialCalendarSourceUrl('http://disdik.jabarprov.go.id/kaldik'), false);
+    assert.strictEqual(isOfficialCalendarSourceUrl('javascript:alert(1)'), false);
+    assert.strictEqual(isOfficialCalendarSourceUrl('ftp://gov.go.id/file'), false);
+  });
+
+  // =========================================================================
+  // TEST G: Mismatched academic year is discarded
+  // =========================================================================
+  await runTest('G. Academic year check: Candidates with different academic year are discarded', () => {
+    const rawJson = JSON.stringify([
+      {
+        province: 'Jawa Barat',
+        regency: 'Kabupaten Bandung',
+        academicYear: '2025/2026', // Old year
+        authority: 'Dinas Pendidikan',
+        documentTitle: 'Kaldik 2025/2026',
+        sourceUrl: 'https://disdik.bandungkab.go.id/kaldik-2025',
+      },
+    ]);
+
+    const groundedSources = [{ uri: 'https://disdik.bandungkab.go.id/kaldik-2025' }];
+
+    const results = parseCalendarSearchResponse(
+      rawJson,
+      'REGENCY',
+      { academicYear: '2026/2027', province: 'Jawa Barat', regency: 'Kabupaten Bandung' },
+      groundedSources
+    );
+
+    assert.strictEqual(results.length, 0, 'Candidate with mismatched academic year must be discarded');
+  });
+
+  // =========================================================================
+  // TEST H: Wrong regency in REGENCY search is discarded
+  // =========================================================================
+  await runTest('H. Regency precision: Kota Bandung candidate discarded when request is Kabupaten Bandung', () => {
+    const rawJson = JSON.stringify([
+      {
+        province: 'Jawa Barat',
+        regency: 'Kota Bandung',
+        academicYear: '2026/2027',
+        authority: 'Dinas Pendidikan Kota Bandung',
+        documentTitle: 'Kaldik Kota Bandung',
+        sourceUrl: 'https://disdik.bandung.go.id/kaldik',
+      },
+    ]);
+
+    const groundedSources = [{ uri: 'https://disdik.bandung.go.id/kaldik' }];
+
+    const results = parseCalendarSearchResponse(
+      rawJson,
+      'REGENCY',
+      { academicYear: '2026/2027', province: 'Jawa Barat', regency: 'Kabupaten Bandung' },
+      groundedSources
+    );
+
+    assert.strictEqual(results.length, 0, 'Candidate with wrong regency must be discarded');
+  });
+
+  // =========================================================================
+  // TEST I: Missing province on REGENCY candidate is discarded
+  // =========================================================================
+  await runTest('I. Province fail-closed: REGENCY candidate with missing province is discarded', () => {
+    const rawJson = JSON.stringify([
+      {
+        regency: 'Kabupaten Bandung',
+        academicYear: '2026/2027',
+        authority: 'Dinas Pendidikan',
+        documentTitle: 'Kaldik',
+        sourceUrl: 'https://disdik.bandungkab.go.id/kaldik',
+        // province omitted
+      },
+    ]);
+
+    const groundedSources = [{ uri: 'https://disdik.bandungkab.go.id/kaldik' }];
+
+    const results = parseCalendarSearchResponse(
+      rawJson,
+      'REGENCY',
+      { academicYear: '2026/2027', province: 'Jawa Barat', regency: 'Kabupaten Bandung' },
+      groundedSources
+    );
+
+    assert.strictEqual(results.length, 0, 'REGENCY candidate with missing province must be discarded');
+  });
+
+  // =========================================================================
+  // TEST J: All online candidates are marked PARTIAL (never VERIFIED)
+  // =========================================================================
+  await runTest('J. Verification policy: Online candidates receive verificationStatus = PARTIAL', () => {
+    const rawJson = JSON.stringify([
+      {
+        province: 'Jawa Barat',
+        academicYear: '2026/2027',
+        authority: 'Dinas Pendidikan Jabar',
+        documentTitle: 'Kaldik Jabar',
+        sourceUrl: 'https://disdik.jabarprov.go.id/kaldik',
+        verificationStatus: 'VERIFIED', // Even if model tries to claim VERIFIED
+      },
+    ]);
+
+    const groundedSources = [{ uri: 'https://disdik.jabarprov.go.id/kaldik' }];
+
+    const results = parseCalendarSearchResponse(
+      rawJson,
+      'PROVINCE',
+      { academicYear: '2026/2027', province: 'Jawa Barat' },
+      groundedSources
+    );
+
+    assert.strictEqual(results.length, 1);
+    assert.strictEqual(results[0].verificationStatus, 'PARTIAL', 'Online discovery status must be PARTIAL');
+  });
+
+  // =========================================================================
+  // TEST K: Malformed AI output / Invalid JSON returns [] without crashing
+  // =========================================================================
+  await runTest('K. Malformed output: Invalid JSON returns empty array gracefully', () => {
+    const malformed1 = 'I found the calendar: [Not valid JSON...';
+    const res1 = parseCalendarSearchResponse(malformed1, 'NATIONAL', { academicYear: '2026/2027' }, []);
+    assert.deepStrictEqual(res1, []);
+
+    const malformed2 = '```json\n{ "object": "not array" }\n```';
+    const res2 = parseCalendarSearchResponse(malformed2, 'NATIONAL', { academicYear: '2026/2027' }, []);
+    assert.deepStrictEqual(res2, []);
+  });
+
+  // =========================================================================
+  // TEST L: Date validation (YYYY-MM-DD preserved, invalid formatted dates omitted)
+  // =========================================================================
+  await runTest('L. Date parsing: Valid YYYY-MM-DD preserved, arbitrary date strings omitted', () => {
+    const rawJson = JSON.stringify([
+      {
+        academicYear: '2026/2027',
+        authority: 'Kemendikdasmen RI',
+        documentTitle: 'Pedoman',
+        sourceUrl: 'https://kemendikdasmen.go.id/kaldik',
+        semesterStartDate: '2026-07-13', // valid
+        semesterEndDate: '18 Desember 2026', // invalid format -> omitted
+        publicationDate: '2026-06-25', // valid
+        effectiveDate: 'invalid date', // invalid -> omitted
+      },
+    ]);
+
+    const groundedSources = [{ uri: 'https://kemendikdasmen.go.id/kaldik' }];
+
+    const results = parseCalendarSearchResponse(
+      rawJson,
+      'NATIONAL',
+      { academicYear: '2026/2027' },
+      groundedSources
+    );
+
+    assert.strictEqual(results.length, 1);
+    assert.strictEqual(results[0].semesterStartDate, '2026-07-13');
+    assert.strictEqual(results[0].semesterEndDate, undefined);
+    assert.strictEqual(results[0].publicationDate, '2026-06-25');
+    assert.strictEqual(results[0].effectiveDate, undefined);
+  });
+
+  // =========================================================================
+  // TEST M: Realistic Google Redirect Grounding URL Resolution
+  // =========================================================================
+  await runTest('M. Google Search Grounding redirect resolved to final official government landing URL', async () => {
+    const fakeGenerate = async (): Promise<GroundedSearchResponse> => {
+      return {
+        text: JSON.stringify([
+          {
+            province: 'Banten',
+            regency: 'Kota Tangerang',
+            academicYear: '2026/2027',
+            authority: 'Pemerintah Kota Tangerang',
+            documentTitle: 'Kalender Pendidikan Kota Tangerang 2026/2027',
+            sourceUrl: 'https://www.tangerangkota.go.id/dokumen/kaldik-2026-2027',
+            semesterStartDate: '2026-07-13',
+            semesterEndDate: '2026-12-19',
+          },
+        ]),
+        candidates: [
+          {
+            groundingMetadata: {
+              groundingChunks: [
+                {
+                  web: {
+                    uri: 'https://vertexaisearch.cloud.google.com/grounding-api-redirect/test123',
+                    title: 'Website Resmi Pemerintah Kota Tangerang',
+                  },
+                },
+              ],
+            },
+          },
+        ],
+      };
+    };
+
+    const fakeResolver = async (uri: string): Promise<string | null> => {
+      if (uri.includes('vertexaisearch.cloud.google.com')) {
+        return 'https://www.tangerangkota.go.id/dokumen/kaldik-2026-2027';
+      }
+      return null;
+    };
+
+    const provider = new GroundedCalendarSearchProvider({
+      generateGroundedContent: fakeGenerate,
+      resolveGroundedUrl: fakeResolver,
+    });
+
+    const results = await provider.search({
+      academicYear: '2026/2027',
+      province: 'Banten',
+      regency: 'Kota Tangerang',
+    });
+
+    assert.strictEqual(results.length, 1, 'Candidate backed by resolved google redirect must be accepted');
+    assert.strictEqual(results[0].sourceLevel, 'REGENCY');
+    assert.strictEqual(results[0].sourceUrl, 'https://www.tangerangkota.go.id/dokumen/kaldik-2026-2027');
+  });
+
+  // =========================================================================
+  // TEST N: Negative Regression - Redirect resolves to non-government site
+  // =========================================================================
+  await runTest('N. Negative regression: Redirect resolving to non-government site is rejected', async () => {
+    const fakeGenerate = async (): Promise<GroundedSearchResponse> => {
+      return {
+        text: JSON.stringify([
+          {
+            province: 'Banten',
+            regency: 'Kota Tangerang',
+            academicYear: '2026/2027',
+            authority: 'Pemerintah Kota Tangerang',
+            documentTitle: 'Kaldik Kota Tangerang',
+            sourceUrl: 'https://www.tangerangkota.go.id/kaldik',
+          },
+        ]),
+        candidates: [
+          {
+            groundingMetadata: {
+              groundingChunks: [
+                {
+                  web: {
+                    uri: 'https://vertexaisearch.cloud.google.com/redirect/123',
+                    title: 'Portal',
+                  },
+                },
+              ],
+            },
+          },
+        ],
+      };
+    };
+
+    const fakeResolver = async (): Promise<string | null> => {
+      return 'https://example.com/kaldik'; // Non-government site
+    };
+
+    const provider = new GroundedCalendarSearchProvider({
+      generateGroundedContent: fakeGenerate,
+      resolveGroundedUrl: fakeResolver,
+    });
+
+    const results = await provider.search({
+      academicYear: '2026/2027',
+      province: 'Banten',
+      regency: 'Kota Tangerang',
+    });
+
+    assert.strictEqual(results.length, 0, 'Candidate with non-government landing redirect must be rejected');
+  });
+
+  // =========================================================================
+  // TEST O: Negative Regression - Redirect cannot resolve
+  // =========================================================================
+  await runTest('O. Negative regression: Redirect failing to resolve is rejected', async () => {
+    const fakeGenerate = async (): Promise<GroundedSearchResponse> => {
+      return {
+        text: JSON.stringify([
+          {
+            province: 'Banten',
+            regency: 'Kota Tangerang',
+            academicYear: '2026/2027',
+            authority: 'Pemerintah Kota Tangerang',
+            documentTitle: 'Kaldik Kota Tangerang',
+            sourceUrl: 'https://www.tangerangkota.go.id/kaldik',
+          },
+        ]),
+        candidates: [
+          {
+            groundingMetadata: {
+              groundingChunks: [
+                {
+                  web: {
+                    uri: 'https://vertexaisearch.cloud.google.com/redirect/failed',
+                    title: 'Broken Redirect',
+                  },
+                },
+              ],
+            },
+          },
+        ],
+      };
+    };
+
+    const fakeResolver = async (): Promise<string | null> => {
+      return null; // Failed resolution
+    };
+
+    const provider = new GroundedCalendarSearchProvider({
+      generateGroundedContent: fakeGenerate,
+      resolveGroundedUrl: fakeResolver,
+    });
+
+    const results = await provider.search({
+      academicYear: '2026/2027',
+      province: 'Banten',
+      regency: 'Kota Tangerang',
+    });
+
+    assert.strictEqual(results.length, 0, 'Unresolvable grounding redirect must be rejected');
+  });
+
+  // =========================================================================
+  // TEST P: Negative Regression - Redirect resolves to social/file-hosting URL
+  // =========================================================================
+  await runTest('P. Negative regression: Redirect resolving to social media or file hosting is rejected', async () => {
+    const fakeGenerate = async (): Promise<GroundedSearchResponse> => {
+      return {
+        text: JSON.stringify([
+          {
+            province: 'Banten',
+            regency: 'Kota Tangerang',
+            academicYear: '2026/2027',
+            authority: 'Pemerintah Kota Tangerang',
+            documentTitle: 'Kaldik Kota Tangerang',
+            sourceUrl: 'https://www.tangerangkota.go.id/kaldik',
+          },
+        ]),
+        candidates: [
+          {
+            groundingMetadata: {
+              groundingChunks: [
+                {
+                  web: {
+                    uri: 'https://vertexaisearch.cloud.google.com/redirect/social',
+                    title: 'Social Portal',
+                  },
+                },
+              ],
+            },
+          },
+        ],
+      };
+    };
+
+    const fakeResolver = async (): Promise<string | null> => {
+      return 'https://facebook.com/disdik.tangerangkota';
+    };
+
+    const provider = new GroundedCalendarSearchProvider({
+      generateGroundedContent: fakeGenerate,
+      resolveGroundedUrl: fakeResolver,
+    });
+
+    const results = await provider.search({
+      academicYear: '2026/2027',
+      province: 'Banten',
+      regency: 'Kota Tangerang',
+    });
+
+    assert.strictEqual(results.length, 0, 'Social media redirect landing must be rejected');
+  });
+
+  // =========================================================================
+  // TEST Q: Negative Regression - Candidate hostname differs from resolved official hostname
+  // =========================================================================
+  await runTest('Q. Negative regression: Mismatched candidate vs resolved official hostname is rejected', async () => {
+    const fakeGenerate = async (): Promise<GroundedSearchResponse> => {
+      return {
+        text: JSON.stringify([
+          {
+            province: 'Jawa Tengah',
+            regency: 'Kota Surakarta',
+            academicYear: '2026/2027',
+            authority: 'Pemerintah Kota Surakarta',
+            documentTitle: 'Kaldik Kota Surakarta',
+            sourceUrl: 'https://www.surakarta.go.id/dokumen/kaldik',
+          },
+        ]),
+        candidates: [
+          {
+            groundingMetadata: {
+              groundingChunks: [
+                {
+                  web: {
+                    uri: 'https://vertexaisearch.cloud.google.com/redirect/surakarta',
+                    title: 'Portal',
+                  },
+                },
+              ],
+            },
+          },
+        ],
+      };
+    };
+
+    const fakeResolver = async (): Promise<string | null> => {
+      // Grounding redirect resolves to a different city's official domain
+      return 'https://www.tangerangkota.go.id/dokumen/kaldik';
+    };
+
+    const provider = new GroundedCalendarSearchProvider({
+      generateGroundedContent: fakeGenerate,
+      resolveGroundedUrl: fakeResolver,
+    });
+
+    const results = await provider.search({
+      academicYear: '2026/2027',
+      province: 'Jawa Tengah',
+      regency: 'Kota Surakarta',
+    });
+
+    assert.strictEqual(results.length, 0, 'Mismatched hostname candidate must be rejected');
+  });
+
+  // =========================================================================
+  // B.4.1D DIAGNOSTIC TESTS
+  // =========================================================================
+
+  // TEST R: Case A — No API key
+  await runTest('R. Diagnostic Case A: No API key returns NO_API_KEY and aiConfigured = false', async () => {
+    // Save original env
+    const originalKey = process.env.GEMINI_API_KEY;
+    delete process.env.GEMINI_API_KEY;
+
+    try {
+      const provider = new GroundedCalendarSearchProvider({ apiKey: '' });
+      const res = await provider.searchWithDiagnostics({
+        academicYear: '2026/2027',
+        province: 'Banten',
+        regency: 'Kota Tangerang',
+      });
+
+      assert.strictEqual(res.diagnostic.aiConfigured, false);
+      assert.strictEqual(res.diagnostic.reason, 'NO_API_KEY');
+      assert.strictEqual(res.candidates.length, 0);
+    } finally {
+      process.env.GEMINI_API_KEY = originalKey;
+    }
+  });
+
+  // TEST S: Case B — Every model errors (MODEL_FAILURE)
+  await runTest('S. Diagnostic Case B: Model error across attempts returns MODEL_FAILURE', async () => {
+    const errorGenerate = async (): Promise<GroundedSearchResponse> => {
+      throw new Error('503 Service Unavailable');
+    };
+
+    const provider = new GroundedCalendarSearchProvider({
+      apiKey: 'test-key',
+      generateGroundedContent: errorGenerate,
+    });
+
+    const res = await provider.searchWithDiagnostics({
+      academicYear: '2026/2027',
+      province: 'Banten',
+      regency: 'Kota Tangerang',
+    });
+
+    assert.strictEqual(res.diagnostic.aiConfigured, true);
+    assert.strictEqual(res.diagnostic.reason, 'MODEL_FAILURE');
+    assert.ok(res.diagnostic.stages.length > 0);
+    assert.strictEqual(res.diagnostic.stages[0].modelAttempts[0].status, 'ERROR');
+    assert.strictEqual(res.diagnostic.stages[0].modelAttempts[0].errorCategory, 'HTTP_503');
+  });
+
+  // TEST T: Case C — Model returns text but no grounding
+  await runTest('T. Diagnostic Case C: Response with text but no grounding returns NO_GROUNDING', async () => {
+    const textNoGroundingGenerate = async (): Promise<GroundedSearchResponse> => {
+      return {
+        text: JSON.stringify([
+          {
+            province: 'Banten',
+            regency: 'Kota Tangerang',
+            academicYear: '2026/2027',
+            authority: 'Pemkot Tangerang',
+            documentTitle: 'Kaldik',
+            sourceUrl: 'https://www.tangerangkota.go.id/kaldik',
+          },
+        ]),
+        candidates: [
+          {
+            groundingMetadata: {
+              groundingChunks: [], // Empty grounding
+            },
+          },
+        ],
+      };
+    };
+
+    const provider = new GroundedCalendarSearchProvider({
+      apiKey: 'test-key',
+      generateGroundedContent: textNoGroundingGenerate,
+    });
+
+    const res = await provider.searchWithDiagnostics({
+      academicYear: '2026/2027',
+      province: 'Banten',
+      regency: 'Kota Tangerang',
+    });
+
+    assert.strictEqual(res.diagnostic.reason, 'NO_GROUNDING');
+  });
+
+  // TEST U: Case D — Grounding exists but redirect resolver returns null
+  await runTest('U. Diagnostic Case D: Grounding present but redirect unresolvable returns GROUNDING_RESOLUTION_FAILED', async () => {
+    const generate = async (): Promise<GroundedSearchResponse> => {
+      return {
+        text: JSON.stringify([
+          {
+            province: 'Banten',
+            regency: 'Kota Tangerang',
+            academicYear: '2026/2027',
+            authority: 'Pemkot Tangerang',
+            documentTitle: 'Kaldik',
+            sourceUrl: 'https://www.tangerangkota.go.id/kaldik',
+          },
+        ]),
+        candidates: [
+          {
+            groundingMetadata: {
+              groundingChunks: [
+                {
+                  web: {
+                    uri: 'https://vertexaisearch.cloud.google.com/redirect/broken',
+                  },
+                },
+              ],
+            },
+          },
+        ],
+      };
+    };
+
+    const nullResolver = async (): Promise<string | null> => null;
+
+    const provider = new GroundedCalendarSearchProvider({
+      apiKey: 'test-key',
+      generateGroundedContent: generate,
+      resolveGroundedUrl: nullResolver,
+    });
+
+    const res = await provider.searchWithDiagnostics({
+      academicYear: '2026/2027',
+      province: 'Banten',
+      regency: 'Kota Tangerang',
+    });
+
+    assert.strictEqual(res.diagnostic.reason, 'GROUNDING_RESOLUTION_FAILED');
+  });
+
+  // TEST V: Case E — Official landing exists but candidate is rejected (e.g. wrong year/mismatched host)
+  await runTest('V. Diagnostic Case E: Official landing resolved but candidate rejected returns CANDIDATE_REJECTED', async () => {
+    const generate = async (): Promise<GroundedSearchResponse> => {
+      return {
+        text: JSON.stringify([
+          {
+            province: 'Banten',
+            regency: 'Kota Tangerang',
+            academicYear: '2025/2026', // Old year -> candidate rejected
+            authority: 'Pemkot Tangerang',
+            documentTitle: 'Kaldik 2025',
+            sourceUrl: 'https://www.tangerangkota.go.id/kaldik-2025',
+          },
+        ]),
+        candidates: [
+          {
+            groundingMetadata: {
+              groundingChunks: [
+                {
+                  web: {
+                    uri: 'https://vertexaisearch.cloud.google.com/redirect/ok',
+                  },
+                },
+              ],
+            },
+          },
+        ],
+      };
+    };
+
+    const validResolver = async (): Promise<string | null> => 'https://www.tangerangkota.go.id/kaldik-2025';
+
+    const provider = new GroundedCalendarSearchProvider({
+      apiKey: 'test-key',
+      generateGroundedContent: generate,
+      resolveGroundedUrl: validResolver,
+    });
+
+    const res = await provider.searchWithDiagnostics({
+      academicYear: '2026/2027',
+      province: 'Banten',
+      regency: 'Kota Tangerang',
+    });
+
+    assert.strictEqual(res.diagnostic.reason, 'CANDIDATE_REJECTED');
+  });
+
+  // TEST W: Case F — Successful search returns empty legitimate result
+  await runTest('W. Diagnostic Case F: Successful search with empty [] candidate result returns NO_OFFICIAL_SOURCE', async () => {
+    const emptyGenerate = async (): Promise<GroundedSearchResponse> => {
+      return {
+        text: '[]',
+        candidates: [
+          {
+            groundingMetadata: {
+              groundingChunks: [
+                {
+                  web: {
+                    uri: 'https://www.tangerangkota.go.id/portal',
+                  },
+                },
+              ],
+            },
+          },
+        ],
+      };
+    };
+
+    const provider = new GroundedCalendarSearchProvider({
+      apiKey: 'test-key',
+      generateGroundedContent: emptyGenerate,
+    });
+
+    const res = await provider.searchWithDiagnostics({
+      academicYear: '2026/2027',
+      province: 'Banten',
+      regency: 'Kota Tangerang',
+    });
+
+    assert.strictEqual(res.diagnostic.reason, 'NO_OFFICIAL_SOURCE');
+  });
+
+  // TEST X: Case G — Tangerang candidate accepted
+  await runTest('X. Diagnostic Case G: Accepted Tangerang candidate returns SUCCESS', async () => {
+    const successGenerate = async (): Promise<GroundedSearchResponse> => {
+      return {
+        text: JSON.stringify([
+          {
+            province: 'Banten',
+            regency: 'Kota Tangerang',
+            academicYear: '2026/2027',
+            authority: 'Dinas Pendidikan Kota Tangerang',
+            documentTitle: 'Kaldik Kota Tangerang 2026/2027',
+            sourceUrl: 'https://www.tangerangkota.go.id/dokumen/kaldik',
+          },
+        ]),
+        candidates: [
+          {
+            groundingMetadata: {
+              groundingChunks: [
+                {
+                  web: {
+                    uri: 'https://vertexaisearch.cloud.google.com/redirect/tang',
+                  },
+                },
+              ],
+            },
+          },
+        ],
+      };
+    };
+
+    const resolver = async (): Promise<string | null> => 'https://www.tangerangkota.go.id/dokumen/kaldik';
+
+    const provider = new GroundedCalendarSearchProvider({
+      apiKey: 'test-key',
+      generateGroundedContent: successGenerate,
+      resolveGroundedUrl: resolver,
+    });
+
+    const res = await provider.searchWithDiagnostics({
+      academicYear: '2026/2027',
+      province: 'Banten',
+      regency: 'Kota Tangerang',
+    });
+
+    assert.strictEqual(res.diagnostic.reason, 'SUCCESS');
+    assert.strictEqual(res.candidates.length, 1);
+    assert.strictEqual(res.candidates[0].sourceLevel, 'REGENCY');
+  });
+
+  // =========================================================================
+  // PROVIDER RESILIENCE REGRESSION TESTS
+  // =========================================================================
+
+  // TEST Y: Provider Resilience A — Failure at REGENCY stops geography fallback immediately
+  await runTest('Y. Provider Resilience A: Real Failure Shape - REGENCY failure stops geography fallback immediately', async () => {
+    let callCount = 0;
+    const errorGenerate = async (): Promise<GroundedSearchResponse> => {
+      callCount++;
+      throw new Error('429 Too Many Requests');
+    };
+
+    const provider = new GroundedCalendarSearchProvider({
+      apiKey: 'test-key',
+      generateGroundedContent: errorGenerate,
+      sleep: async () => {},
+    });
+
+    const res = await provider.searchWithDiagnostics({
+      academicYear: '2026/2027',
+      province: 'Banten',
+      regency: 'Kota Tangerang',
+    });
+
+    assert.strictEqual(res.diagnostic.reason, 'MODEL_FAILURE');
+    assert.strictEqual(res.diagnostic.stages.length, 1, 'Must stop at REGENCY stage and not query PROVINCE or NATIONAL');
+    assert.strictEqual(res.diagnostic.stages[0].level, 'REGENCY');
+  });
+
+  // TEST Z: Provider Resilience B — Transient 429 retries same model and succeeds
+  await runTest('Z. Provider Resilience B: Transient 429 retries same model and succeeds without model fallback', async () => {
+    let generateAttempts = 0;
+    const sleptMs: number[] = [];
+
+    const retryGenerate = async (): Promise<GroundedSearchResponse> => {
+      generateAttempts++;
+      if (generateAttempts < 3) {
+        throw new Error('429 Resource Exhausted');
+      }
+      return {
+        text: JSON.stringify([
+          {
+            province: 'Banten',
+            regency: 'Kota Tangerang',
+            academicYear: '2026/2027',
+            authority: 'Dinas Pendidikan Kota Tangerang',
+            documentTitle: 'Kaldik Kota Tangerang',
+            sourceUrl: 'https://www.tangerangkota.go.id/kaldik',
+          },
+        ]),
+        candidates: [
+          {
+            groundingMetadata: {
+              groundingChunks: [{ web: { uri: 'https://www.tangerangkota.go.id/kaldik' } }],
+            },
+          },
+        ],
+      };
+    };
+
+    const provider = new GroundedCalendarSearchProvider({
+      apiKey: 'test-key',
+      generateGroundedContent: retryGenerate,
+      resolveGroundedUrl: async () => 'https://www.tangerangkota.go.id/kaldik',
+      sleep: async (ms) => { sleptMs.push(ms); },
+    });
+
+    const res = await provider.searchWithDiagnostics({
+      academicYear: '2026/2027',
+      province: 'Banten',
+      regency: 'Kota Tangerang',
+    });
+
+    assert.strictEqual(res.diagnostic.reason, 'SUCCESS');
+    assert.strictEqual(generateAttempts, 3, 'Primary model must be retried 3 times');
+    assert.deepStrictEqual(sleptMs, [800, 1600], 'Exponential backoff delays must be passed to sleep');
+  });
+
+  // TEST AA: Provider Resilience C — MODEL_NOT_FOUND skips retries and succeeds on fallback model
+  await runTest('AA. Provider Resilience C: MODEL_NOT_FOUND skips retries and succeeds on fallback model', async () => {
+    const modelNotFoundGenerate = async (prompt: string, model: string): Promise<GroundedSearchResponse> => {
+      if (model === 'gemini-3.5-flash-lite') {
+        throw new Error('404 Model Not Found');
+      }
+      return {
+        text: JSON.stringify([
+          {
+            province: 'Banten',
+            regency: 'Kota Tangerang',
+            academicYear: '2026/2027',
+            authority: 'Pemkot Tangerang',
+            documentTitle: 'Kaldik',
+            sourceUrl: 'https://www.tangerangkota.go.id/kaldik',
+          },
+        ]),
+        candidates: [
+          {
+            groundingMetadata: {
+              groundingChunks: [{ web: { uri: 'https://www.tangerangkota.go.id/kaldik' } }],
+            },
+          },
+        ],
+      };
+    };
+
+    const provider = new GroundedCalendarSearchProvider({
+      apiKey: 'test-key',
+      generateGroundedContent: modelNotFoundGenerate,
+      resolveGroundedUrl: async () => 'https://www.tangerangkota.go.id/kaldik',
+      sleep: async () => {},
+    });
+
+    const res = await provider.searchWithDiagnostics({
+      academicYear: '2026/2027',
+      province: 'Banten',
+      regency: 'Kota Tangerang',
+    });
+
+    assert.strictEqual(res.diagnostic.reason, 'SUCCESS');
+  });
+
+  // TEST AB: Provider Resilience D — HTTP 403 halts search immediately
+  await runTest('AB. Provider Resilience D: HTTP 403 permission error halts search immediately without retries or geography fallback', async () => {
+    let attempts = 0;
+    const permDeniedGenerate = async (): Promise<GroundedSearchResponse> => {
+      attempts++;
+      throw new Error('403 PERMISSION_DENIED: API key not valid');
+    };
+
+    const provider = new GroundedCalendarSearchProvider({
+      apiKey: 'test-key',
+      generateGroundedContent: permDeniedGenerate,
+      sleep: async () => {},
+    });
+
+    const res = await provider.searchWithDiagnostics({
+      academicYear: '2026/2027',
+      province: 'Banten',
+      regency: 'Kota Tangerang',
+    });
+
+    assert.strictEqual(res.diagnostic.reason, 'MODEL_FAILURE');
+    assert.strictEqual(attempts, 1, '403 error must not be retried repeatedly');
+    assert.strictEqual(res.diagnostic.stages.length, 1, 'Must stop geography search immediately');
+  });
+
+  // TEST AC: Provider Resilience E — Valid empty [] at REGENCY falls back to PROVINCE
+  await runTest('AC. Provider Resilience E: Valid empty [] at REGENCY falls back to PROVINCE', async () => {
+    const queriedLevels: string[] = [];
+    const validEmptyGenerate = async (prompt: string): Promise<GroundedSearchResponse> => {
+      if (prompt.includes('Kabupaten/Kota')) queriedLevels.push('REGENCY');
+      else if (prompt.includes('tingkat Provinsi')) queriedLevels.push('PROVINCE');
+      else queriedLevels.push('NATIONAL');
+
+      return { text: '[]' };
+    };
+
+    const provider = new GroundedCalendarSearchProvider({
+      apiKey: 'test-key',
+      generateGroundedContent: validEmptyGenerate,
+      sleep: async () => {},
+    });
+
+    const res = await provider.searchWithDiagnostics({
+      academicYear: '2026/2027',
+      province: 'Banten',
+      regency: 'Kota Tangerang',
+    });
+
+    assert.deepStrictEqual(queriedLevels, ['REGENCY', 'PROVINCE', 'NATIONAL']);
+    assert.strictEqual(res.diagnostic.stages.length, 3);
+  });
+
+  // TEST AD: Provider Resilience F — All valid empty [] results yield NO_OFFICIAL_SOURCE
+  await runTest('AD. Provider Resilience F: All valid empty [] results yield NO_OFFICIAL_SOURCE (not NO_GROUNDING or MODEL_FAILURE)', async () => {
+    const provider = new GroundedCalendarSearchProvider({
+      apiKey: 'test-key',
+      generateGroundedContent: async () => ({ text: '[]' }),
+      sleep: async () => {},
+    });
+
+    const res = await provider.searchWithDiagnostics({
+      academicYear: '2026/2027',
+      province: 'Banten',
+      regency: 'Kota Tangerang',
+    });
+
+    assert.strictEqual(res.diagnostic.reason, 'NO_OFFICIAL_SOURCE');
+    assert.strictEqual(res.diagnostic.stages.length, 3);
+  });
+
+  // =========================================================================
+  // TRUSTED CALENDAR SEARCH PROVIDER AUDIT (FREE-TIER PLAIN GEMINI)
+  // =========================================================================
+
+  // TEST AE: Real Web Discovery contract — Provider codebase integrates Google Search Grounding with gemini-2.5-flash-lite
+  await runTest('AE. Real Web Discovery: TrustedCalendarSearchProvider integrates Google Search Grounding with gemini-2.5-flash-lite', () => {
+    const filePath = path.resolve(process.cwd(), 'server/trustedCalendarProvider.ts');
+    const source = fs.readFileSync(filePath, 'utf-8');
+    assert.ok(
+      source.includes('googleSearch'),
+      'trustedCalendarProvider.ts must configure googleSearch tool for real web discovery'
+    );
+    assert.ok(
+      source.includes('gemini-2.5-flash-lite'),
+      'trustedCalendarProvider.ts must use gemini-2.5-flash-lite for discovery'
+    );
+  });
+
+  // TEST AF: Plain Gemini discovery & extraction without tools
+  await runTest('AF. Plain Gemini: Plain generator invoked without tools for discovery & extraction', async () => {
+    let plainCalls = 0;
+    const fakePlainGenerate = async (prompt: string, model: string) => {
+      plainCalls++;
+      if (prompt.includes('Sebutkan 3-6 URL resmi')) {
+        return { text: JSON.stringify(['https://disdik.tangerangkota.go.id/kaldik-2026-2027']) };
+      }
+      return {
+        text: JSON.stringify([
+          {
+            province: 'Banten',
+            regency: 'Kota Tangerang',
+            academicYear: '2026/2027',
+            authority: 'Dinas Pendidikan Kota Tangerang',
+            documentTitle: 'Pedoman Kaldik Kota Tangerang 2026/2027',
+            semester1StartDate: '2026-07-13',
+            semester1EndDate: '2026-12-18',
+            semester2StartDate: '2027-01-04',
+            semester2EndDate: '2027-06-25',
+          },
+        ]),
+      };
+    };
+
+    const fakeFetch = async (url: string) => {
+      return {
+        ok: true,
+        status: 200,
+        text: 'Kalender Pendidikan Tahun Ajaran 2026/2027 Kota Tangerang Provinsi Banten resmi berlaku. Semester 1 dimulai 13 Juli 2026 sampai 18 Desember 2026. Semester 2 dimulai 4 Januari 2027 sampai 25 Juni 2027.',
+        finalUrl: url,
+        contentType: 'text/html',
+        isPdf: false,
+      };
+    };
+
+    const provider = new TrustedCalendarSearchProvider({
+      generatePlainContent: fakePlainGenerate,
+      fetchSourceContent: fakeFetch,
+    });
+
+    const candidates = await provider.search({
+      academicYear: '2026/2027',
+      province: 'Banten',
+      regency: 'Kota Tangerang',
+    });
+
+    assert.strictEqual(candidates.length, 1);
+    assert.strictEqual(candidates[0].sourceLevel, 'REGENCY');
+    assert.strictEqual(candidates[0].semester1StartDate, '2026-07-13');
+    assert.ok(plainCalls >= 1, 'Plain Gemini generator must be used');
+  });
+
+  // TEST AG: Regency short-circuit
+  await runTest('AG. Regency short-circuit: REGENCY valid -> PROVINCE 0, NATIONAL 0', async () => {
+    let queriedStages: string[] = [];
+
+    const provider = new TrustedCalendarSearchProvider({
+      discoverCandidateUrls: async (req, level) => {
+        queriedStages.push(level);
+        if (level === 'REGENCY') {
+          return ['https://disdik.bandungkab.go.id/kaldik-2026'];
+        }
+        return [];
+      },
+      fetchSourceContent: async (url) => ({
+        ok: true,
+        status: 200,
+        text: 'Pedoman Kalender Pendidikan Tahun Ajaran 2026/2027 Kabupaten Bandung Jawa Barat',
+        finalUrl: url,
+        contentType: 'text/html',
+        isPdf: false,
+      }),
+      generatePlainContent: async () => ({
+        text: JSON.stringify([
+          {
+            province: 'Jawa Barat',
+            regency: 'Kabupaten Bandung',
+            academicYear: '2026/2027',
+            authority: 'Disdik Kab Bandung',
+            documentTitle: 'Kaldik 2026/2027',
+          },
+        ]),
+      }),
+    });
+
+    const results = await provider.search({
+      academicYear: '2026/2027',
+      province: 'Jawa Barat',
+      regency: 'Kabupaten Bandung',
+    });
+
+    assert.strictEqual(results.length, 1);
+    assert.strictEqual(results[0].sourceLevel, 'REGENCY');
+    assert.deepStrictEqual(queriedStages, ['REGENCY'], 'Must short-circuit immediately at REGENCY');
+  });
+
+  // TEST AH: Province fallback
+  await runTest('AH. Province fallback: REGENCY empty -> PROVINCE valid -> NATIONAL 0', async () => {
+    let queriedStages: string[] = [];
+
+    const provider = new TrustedCalendarSearchProvider({
+      discoverCandidateUrls: async (req, level) => {
+        queriedStages.push(level);
+        if (level === 'PROVINCE') {
+          return ['https://disdik.jabarprov.go.id/kaldik-2026'];
+        }
+        return [];
+      },
+      fetchSourceContent: async (url) => ({
+        ok: true,
+        status: 200,
+        text: 'Keputusan Kadisdik Kalender Pendidikan 2026/2027 Provinsi Jawa Barat',
+        finalUrl: url,
+        contentType: 'text/html',
+        isPdf: false,
+      }),
+      generatePlainContent: async () => ({
+        text: JSON.stringify([
+          {
+            province: 'Jawa Barat',
+            academicYear: '2026/2027',
+            authority: 'Dinas Pendidikan Jawa Barat',
+            documentTitle: 'Kaldik Provinsi 2026/2027',
+          },
+        ]),
+      }),
+    });
+
+    const results = await provider.search({
+      academicYear: '2026/2027',
+      province: 'Jawa Barat',
+      regency: 'Kabupaten Bandung Barat',
+    });
+
+    assert.strictEqual(results.length, 1);
+    assert.strictEqual(results[0].sourceLevel, 'PROVINCE');
+    assert.deepStrictEqual(queriedStages, ['REGENCY', 'PROVINCE'], 'Must fall back to PROVINCE and stop before NATIONAL');
+  });
+
+  // TEST AI: National fallback
+  await runTest('AI. National fallback: REGENCY empty, PROVINCE empty -> NATIONAL valid', async () => {
+    let queriedStages: string[] = [];
+
+    const provider = new TrustedCalendarSearchProvider({
+      discoverCandidateUrls: async (req, level) => {
+        queriedStages.push(level);
+        if (level === 'NATIONAL') {
+          return ['https://kemendikdasmen.go.id/pedoman-kaldik-2026'];
+        }
+        return [];
+      },
+      fetchSourceContent: async (url) => ({
+        ok: true,
+        status: 200,
+        text: 'Pedoman Kalender Pendidikan Tahun Pelajaran 2026/2027 Kementerian Pendidikan Dasar dan Menengah RI',
+        finalUrl: url,
+        contentType: 'text/html',
+        isPdf: false,
+      }),
+      generatePlainContent: async () => ({
+        text: JSON.stringify([
+          {
+            academicYear: '2026/2027',
+            authority: 'Kemendikdasmen RI',
+            documentTitle: 'Pedoman Kaldik Nasional 2026/2027',
+          },
+        ]),
+      }),
+    });
+
+    const results = await provider.search({
+      academicYear: '2026/2027',
+      province: 'Papua Barat Daya',
+      regency: 'Kabupaten Raja Ampat',
+    });
+
+    assert.strictEqual(results.length, 1);
+    assert.strictEqual(results[0].sourceLevel, 'NATIONAL');
+    assert.deepStrictEqual(queriedStages, ['REGENCY', 'PROVINCE', 'NATIONAL']);
+  });
+
+  // TEST AJ: Reject fake AI URL (HTTP 404 / unreachable)
+  await runTest('AJ. Reject fake AI URL: Unreachable / 404 candidate is discarded and returns National Base fallback', async () => {
+    const provider = new TrustedCalendarSearchProvider({
+      discoverCandidateUrls: async () => ['https://disdik.tangerangkota.go.id/fake-url-not-found-404'],
+      fetchSourceContent: async () => null, // Unreachable / 404
+      generatePlainContent: async () => ({ text: '[]' }),
+    });
+
+    const res = await provider.searchWithDiagnostics({
+      academicYear: '2026/2027',
+      province: 'Banten',
+      regency: 'Kota Tangerang',
+    });
+
+    assert.strictEqual(res.candidates.length, 1);
+    assert.strictEqual(res.candidates[0].sourceLevel, 'NATIONAL');
+    assert.strictEqual(res.diagnostic.reason, 'CANDIDATE_REJECTED');
+  });
+
+  // TEST AK: Reject unsafe / non-HTTPS / localhost URLs
+  await runTest('AK. Reject unsafe URLs: Insecure HTTP and private/localhost targets are strictly discarded', async () => {
+    assert.strictEqual(isSafeCalendarSourceUrl('http://disdik.tangerangkota.go.id/kaldik'), false);
+    assert.strictEqual(isSafeCalendarSourceUrl('https://localhost:3000/kaldik'), false);
+    assert.strictEqual(isSafeCalendarSourceUrl('https://127.0.0.1/kaldik'), false);
+    assert.strictEqual(isSafeCalendarSourceUrl('https://192.168.1.1/kaldik'), false);
+    assert.strictEqual(isSafeCalendarSourceUrl('javascript:alert(1)'), false);
+    assert.strictEqual(isSafeCalendarSourceUrl('data:text/html,abc'), false);
+    assert.strictEqual(isSafeCalendarSourceUrl('https://disdik.tangerangkota.go.id/kaldik'), true);
+    assert.strictEqual(isSafeCalendarSourceUrl('https://smkn1tangerang.sch.id/kaldik'), true);
+    assert.strictEqual(isSafeCalendarSourceUrl('https://kaldikguru.com/tangerang-2026'), true);
+  });
+
+  // TEST AL: Reject valid .go.id but unrelated page
+  await runTest('AL. Reject unrelated page: Valid .go.id without calendar keywords/year is discarded and returns National Base', async () => {
+    const provider = new TrustedCalendarSearchProvider({
+      discoverCandidateUrls: async () => ['https://tangerangkota.go.id/berita/pelantikan-pejabat-2026'],
+      fetchSourceContent: async (url) => ({
+        ok: true,
+        status: 200,
+        text: 'Wali Kota Tangerang melantik sejumlah pejabat struktural di lingkungan pemerintah kota Tangerang.',
+        finalUrl: url,
+        contentType: 'text/html',
+        isPdf: false,
+      }),
+      generatePlainContent: async () => ({ text: '[]' }),
+    });
+
+    const res = await provider.searchWithDiagnostics({
+      academicYear: '2026/2027',
+      province: 'Banten',
+      regency: 'Kota Tangerang',
+    });
+
+    assert.strictEqual(res.candidates.length, 1);
+    assert.strictEqual(res.candidates[0].sourceLevel, 'NATIONAL');
+    assert.strictEqual(res.diagnostic.reason, 'CANDIDATE_REJECTED');
+  });
+
+  // TEST AM: Verified source + incomplete dates
+  await runTest('AM. Incomplete dates: Official source verified but dates missing -> PARTIAL candidate with empty dates', async () => {
+    const provider = new TrustedCalendarSearchProvider({
+      discoverCandidateUrls: async () => ['https://disdik.tangerangkota.go.id/pengumuman-kaldik-2026-2027'],
+      fetchSourceContent: async (url) => ({
+        ok: true,
+        status: 200,
+        text: 'Pengumuman Resmi: Kalender Pendidikan Tahun Ajaran 2026/2027 Kota Tangerang telah diterbitkan dan dapat diunduh di sekretariat dinas.',
+        finalUrl: url,
+        contentType: 'text/html',
+        isPdf: false,
+      }),
+      generatePlainContent: async () => ({
+        text: JSON.stringify([
+          {
+            province: 'Banten',
+            regency: 'Kota Tangerang',
+            academicYear: '2026/2027',
+            authority: 'Dinas Pendidikan Kota Tangerang',
+            documentTitle: 'Pengumuman Kalender Pendidikan Kota Tangerang',
+            // All dates omitted/empty
+          },
+        ]),
+      }),
+    });
+
+    const results = await provider.search({
+      academicYear: '2026/2027',
+      province: 'Banten',
+      regency: 'Kota Tangerang',
+    });
+
+    assert.strictEqual(results.length, 1);
+    assert.strictEqual(results[0].verificationStatus, 'PARTIAL');
+    assert.strictEqual(results[0].sourceUrl, 'https://disdik.tangerangkota.go.id/pengumuman-kaldik-2026-2027');
+    assert.strictEqual(results[0].semester1StartDate, undefined);
+    assert.strictEqual(results[0].semester1EndDate, undefined);
+  });
+
+  // TEST AN: No fabrication — Provider enforces verified sourceUrl and academicYear
+  await runTest('AN. No fabrication: AI attempt to invent alternate sourceUrl or academicYear is ignored', async () => {
+    const verifiedOfficialUrl = 'https://disdik.tangerangkota.go.id/kaldik-2026-2027';
+    const provider = new TrustedCalendarSearchProvider({
+      discoverCandidateUrls: async () => [verifiedOfficialUrl],
+      fetchSourceContent: async (url) => ({
+        ok: true,
+        status: 200,
+        text: 'Kalender Pendidikan Tahun Ajaran 2026/2027 Kota Tangerang resmi.',
+        finalUrl: url,
+        contentType: 'text/html',
+        isPdf: false,
+      }),
+      generatePlainContent: async () => ({
+        text: JSON.stringify([
+          {
+            province: 'Banten',
+            regency: 'Kota Tangerang',
+            academicYear: '2099/3000', // Fabricated future year!
+            authority: 'Dinas Pendidikan',
+            documentTitle: 'Kaldik',
+            sourceUrl: 'https://fake-url-invented-by-ai.com', // Fabricated URL!
+            semester1StartDate: 'invalid-date-string', // Malformed date!
+          },
+        ]),
+      }),
+    });
+
+    const results = await provider.search({
+      academicYear: '2026/2027',
+      province: 'Banten',
+      regency: 'Kota Tangerang',
+    });
+
+    assert.strictEqual(results.length, 1);
+    assert.strictEqual(results[0].sourceUrl, verifiedOfficialUrl, 'Must use verified official URL, not AI hallucination');
+    assert.strictEqual(results[0].academicYear, '2026/2027', 'Must preserve requested academicYear');
+    assert.strictEqual(results[0].semester1StartDate, undefined, 'Invalid date format must be sanitized to undefined');
+  });
+
+  // TEST AO: Kota Tangerang contract simulation
+  await runTest('AO. Kota Tangerang contract: Kota Tangerang, Banten, 2026/2027 resolves to REGENCY candidate after HTTP verification', async () => {
+    const verifiedUrl = 'https://disdik.tangerangkota.go.id/kalender-pendidikan-2026-2027';
+    const provider = new TrustedCalendarSearchProvider({
+      fetchSourceContent: async (url) => {
+        if (url === verifiedUrl) {
+          return {
+            ok: true,
+            status: 200,
+            text: 'Keputusan Kepala Dinas Pendidikan Kota Tangerang tentang Pedoman Kalender Pendidikan Tahun Ajaran 2026/2027. Semester 1 dimulai 2026-07-13 sampai 2026-12-18.',
+            finalUrl: verifiedUrl,
+            contentType: 'text/html',
+            isPdf: false,
+          };
+        }
+        return null;
+      },
+      generatePlainContent: async () => ({
+        text: JSON.stringify([
+          {
+            province: 'Banten',
+            regency: 'Kota Tangerang',
+            academicYear: '2026/2027',
+            authority: 'Dinas Pendidikan Kota Tangerang',
+            documentTitle: 'Pedoman Kalender Pendidikan Tahun Ajaran 2026/2027',
+            documentNumber: '421/01-Disdik/2026',
+            semester1StartDate: '2026-07-13',
+            semester1EndDate: '2026-12-18',
+          },
+        ]),
+      }),
+    });
+
+    const res = await provider.searchWithDiagnostics({
+      academicYear: '2026/2027',
+      province: 'Banten',
+      regency: 'Kota Tangerang',
+    });
+
+    assert.strictEqual(res.diagnostic.reason, 'SUCCESS');
+    assert.strictEqual(res.candidates.length, 1);
+    assert.strictEqual(res.candidates[0].sourceLevel, 'REGENCY');
+    assert.strictEqual(res.candidates[0].regency, 'Kota Tangerang');
+    assert.strictEqual(res.candidates[0].sourceUrl, verifiedUrl);
+    assert.strictEqual(res.candidates[0].verificationStatus, 'PARTIAL');
+  });
+
+  // TEST AP: Empty chain across all stages returns NO_OFFICIAL_SOURCE with National Base fallback
+  await runTest('AP. Empty chain: All stages empty returns NO_OFFICIAL_SOURCE and attaches National Base', async () => {
+    const provider = new TrustedCalendarSearchProvider({
+      discoverCandidateUrls: async () => [],
+      fetchSourceContent: async () => null,
+      generatePlainContent: async () => ({ text: '[]' }),
+    });
+
+    const res = await provider.searchWithDiagnostics({
+      academicYear: '2026/2027',
+      province: 'Kalimantan Utara',
+      regency: 'Kabupaten Tana Tidung',
+    });
+
+    assert.strictEqual(res.candidates.length, 1);
+    assert.strictEqual(res.candidates[0].sourceLevel, 'NATIONAL');
+    assert.strictEqual(res.diagnostic.reason, 'NO_OFFICIAL_SOURCE');
+    assert.strictEqual(res.diagnostic.stages.length, 3);
+  });
+
+  // TEST AQ: Real link discovery — Seed HTML with relative official link is discovered and verified
+  await runTest('AQ. Real link discovery: Relative URL in official seed HTML is resolved and accepted', async () => {
+    const seedUrl = 'https://disdik.tangerangkota.go.id';
+    const targetDocUrl = 'https://disdik.tangerangkota.go.id/dokumen/kalender-pendidikan-2026-2027';
+
+    const provider = new TrustedCalendarSearchProvider({
+      fetchSourceContent: async (url) => {
+        if (url === seedUrl) {
+          return {
+            ok: true,
+            status: 200,
+            text: 'Dinas Pendidikan Kota Tangerang Beranda',
+            rawHtml: '<html><body><h1>Portal Disdik</h1><a href="/dokumen/kalender-pendidikan-2026-2027">Pedoman Kalender Pendidikan 2026/2027</a></body></html>',
+            finalUrl: seedUrl,
+            contentType: 'text/html',
+            isPdf: false,
+          };
+        }
+        if (url === targetDocUrl) {
+          return {
+            ok: true,
+            status: 200,
+            text: 'Pedoman Kalender Pendidikan Tahun Ajaran 2026/2027 Kota Tangerang Provinsi Banten resmi diterbitkan. Semester 1 dimulai 13 Juli 2026.',
+            finalUrl: targetDocUrl,
+            contentType: 'text/html',
+            isPdf: false,
+          };
+        }
+        return null;
+      },
+      generatePlainContent: async () => ({
+        text: JSON.stringify([
+          {
+            province: 'Banten',
+            regency: 'Kota Tangerang',
+            academicYear: '2026/2027',
+            authority: 'Dinas Pendidikan Kota Tangerang',
+            documentTitle: 'Pedoman Kalender Pendidikan 2026/2027',
+            semester1StartDate: '2026-07-13',
+          },
+        ]),
+      }),
+    });
+
+    const res = await provider.searchWithDiagnostics({
+      academicYear: '2026/2027',
+      province: 'Banten',
+      regency: 'Kota Tangerang',
+    });
+
+    assert.strictEqual(res.diagnostic.reason, 'SUCCESS');
+    assert.strictEqual(res.candidates.length, 1);
+    assert.strictEqual(res.candidates[0].sourceUrl, targetDocUrl);
+    assert.strictEqual(res.candidates[0].semester1StartDate, '2026-07-13');
+  });
+
+  // TEST AR: Reject irrelevant links — Homepage with general links produces no false calendar candidate
+  await runTest('AR. Reject irrelevant links: Seed HTML with general non-calendar links produces no false candidate and returns National Base', async () => {
+    const seedUrl = 'https://disdik.tangerangkota.go.id';
+
+    const provider = new TrustedCalendarSearchProvider({
+      generatePlainContent: async () => ({ text: '[]' }),
+      fetchSourceContent: async (url) => {
+        if (url === seedUrl) {
+          return {
+            ok: true,
+            status: 200,
+            text: 'Dinas Pendidikan Berita Profil Galeri Pengumuman Umum',
+            rawHtml: '<html><body><a href="/berita">Berita Terkini</a><a href="/profil">Profil Pejabat</a><a href="/galeri">Galeri Foto</a><a href="/pengumuman">Pengumuman Umum</a></body></html>',
+            finalUrl: seedUrl,
+            contentType: 'text/html',
+            isPdf: false,
+          };
+        }
+        return null;
+      },
+    });
+
+    const res = await provider.searchWithDiagnostics({
+      academicYear: '2026/2027',
+      province: 'Banten',
+      regency: 'Kota Tangerang',
+    });
+
+    assert.strictEqual(res.candidates.length, 1);
+    assert.strictEqual(res.candidates[0].sourceLevel, 'NATIONAL');
+    assert.strictEqual(res.diagnostic.reason, 'NO_OFFICIAL_SOURCE');
+  });
+
+  // TEST AS: Date hallucination rejected — AI date not in sourceText is discarded
+  await runTest('AS. Date hallucination rejected: AI date absent from sourceText is discarded (undefined)', async () => {
+    const verifiedUrl = 'https://disdik.tangerangkota.go.id/kaldik-2026';
+
+    const provider = new TrustedCalendarSearchProvider({
+      discoverCandidateUrls: async () => [verifiedUrl],
+      fetchSourceContent: async (url) => ({
+        ok: true,
+        status: 200,
+        text: 'Kalender Pendidikan Tahun Ajaran 2026/2027 Kota Tangerang resmi diterbitkan.',
+        finalUrl: verifiedUrl,
+        contentType: 'text/html',
+        isPdf: false,
+      }),
+      generatePlainContent: async () => ({
+        text: JSON.stringify([
+          {
+            province: 'Banten',
+            regency: 'Kota Tangerang',
+            academicYear: '2026/2027',
+            authority: 'Dinas Pendidikan Kota Tangerang',
+            documentTitle: 'Kaldik Kota Tangerang',
+            semester1StartDate: '2026-07-13', // Hallucinated date not in sourceText!
+          },
+        ]),
+      }),
+    });
+
+    const results = await provider.search({
+      academicYear: '2026/2027',
+      province: 'Banten',
+      regency: 'Kota Tangerang',
+    });
+
+    assert.strictEqual(results.length, 1);
+    assert.strictEqual(results[0].semester1StartDate, undefined, 'Hallucinated date must become undefined');
+  });
+
+  // TEST AT: Indonesian date evidence accepted — Indonesian textual date in sourceText is accepted
+  await runTest('AT. Indonesian date evidence accepted: Textual date "13 Juli 2026" maps to 2026-07-13', async () => {
+    const verifiedUrl = 'https://disdik.tangerangkota.go.id/kaldik-2026';
+
+    const provider = new TrustedCalendarSearchProvider({
+      discoverCandidateUrls: async () => [verifiedUrl],
+      fetchSourceContent: async (url) => ({
+        ok: true,
+        status: 200,
+        text: 'Kalender Pendidikan Tahun Ajaran 2026/2027 Kota Tangerang. Semester ganjil dimulai tanggal 13 Juli 2026.',
+        finalUrl: verifiedUrl,
+        contentType: 'text/html',
+        isPdf: false,
+      }),
+      generatePlainContent: async () => ({
+        text: JSON.stringify([
+          {
+            province: 'Banten',
+            regency: 'Kota Tangerang',
+            academicYear: '2026/2027',
+            authority: 'Dinas Pendidikan Kota Tangerang',
+            documentTitle: 'Kaldik Kota Tangerang',
+            semester1StartDate: '2026-07-13',
+          },
+        ]),
+      }),
+    });
+
+    const results = await provider.search({
+      academicYear: '2026/2027',
+      province: 'Banten',
+      regency: 'Kota Tangerang',
+    });
+
+    assert.strictEqual(results.length, 1);
+    assert.strictEqual(results[0].semester1StartDate, '2026-07-13');
+  });
+
+  // TEST AU: Slash date accepted — Numeric slash date in sourceText is accepted
+  await runTest('AU. Slash date accepted: Numeric date "13/07/2026" in sourceText maps to 2026-07-13', async () => {
+    const verifiedUrl = 'https://disdik.tangerangkota.go.id/kaldik-2026';
+
+    const provider = new TrustedCalendarSearchProvider({
+      discoverCandidateUrls: async () => [verifiedUrl],
+      fetchSourceContent: async (url) => ({
+        ok: true,
+        status: 200,
+        text: 'Kalender Pendidikan Tahun Ajaran 2026/2027 Kota Tangerang. Mulai semester: 13/07/2026.',
+        finalUrl: verifiedUrl,
+        contentType: 'text/html',
+        isPdf: false,
+      }),
+      generatePlainContent: async () => ({
+        text: JSON.stringify([
+          {
+            province: 'Banten',
+            regency: 'Kota Tangerang',
+            academicYear: '2026/2027',
+            authority: 'Dinas Pendidikan Kota Tangerang',
+            documentTitle: 'Kaldik Kota Tangerang',
+            semester1StartDate: '2026-07-13',
+          },
+        ]),
+      }),
+    });
+
+    const results = await provider.search({
+      academicYear: '2026/2027',
+      province: 'Banten',
+      regency: 'Kota Tangerang',
+    });
+
+    assert.strictEqual(results.length, 1);
+    assert.strictEqual(results[0].semester1StartDate, '2026-07-13');
+  });
+
+  // TEST AV: Wrong date rejected — Date in sourceText is 13 Juli 2026, AI outputs 2026-07-14 -> undefined
+  await runTest('AV. Wrong date rejected: Source has 13 Juli 2026, AI outputs 2026-07-14 -> rejected (undefined)', async () => {
+    const verifiedUrl = 'https://disdik.tangerangkota.go.id/kaldik-2026';
+
+    const provider = new TrustedCalendarSearchProvider({
+      discoverCandidateUrls: async () => [verifiedUrl],
+      fetchSourceContent: async (url) => ({
+        ok: true,
+        status: 200,
+        text: 'Kalender Pendidikan Tahun Ajaran 2026/2027 Kota Tangerang. Mulai pembelajaran: 13 Juli 2026.',
+        finalUrl: verifiedUrl,
+        contentType: 'text/html',
+        isPdf: false,
+      }),
+      generatePlainContent: async () => ({
+        text: JSON.stringify([
+          {
+            province: 'Banten',
+            regency: 'Kota Tangerang',
+            academicYear: '2026/2027',
+            authority: 'Dinas Pendidikan Kota Tangerang',
+            documentTitle: 'Kaldik Kota Tangerang',
+            semester1StartDate: '2026-07-14', // Incorrect day!
+          },
+        ]),
+      }),
+    });
+
+    const results = await provider.search({
+      academicYear: '2026/2027',
+      province: 'Banten',
+      regency: 'Kota Tangerang',
+    });
+
+    assert.strictEqual(results.length, 1);
+    assert.strictEqual(results[0].semester1StartDate, undefined, 'Mismatched date must be discarded');
+  });
+
+  // TEST AW: PDF partial — Verified .go.id PDF with no extracted text yields PARTIAL with empty dates
+  await runTest('AW. PDF partial: Verified .go.id PDF without extracted text returns PARTIAL with empty semester dates', async () => {
+    const pdfUrl = 'https://disdik.tangerangkota.go.id/dokumen/kaldik-2026-2027.pdf';
+
+    const provider = new TrustedCalendarSearchProvider({
+      discoverCandidateUrls: async () => [pdfUrl],
+      fetchSourceContent: async (url) => ({
+        ok: true,
+        status: 200,
+        text: 'Kalender Pendidikan Tahun Pelajaran 2026/2027 Kota Tangerang.',
+        rawHtml: '',
+        finalUrl: pdfUrl,
+        contentType: 'application/pdf',
+        isPdf: true,
+      }),
+    });
+
+    const res = await provider.searchWithDiagnostics({
+      academicYear: '2026/2027',
+      province: 'Banten',
+      regency: 'Kota Tangerang',
+    });
+
+    assert.strictEqual(res.diagnostic.reason, 'SUCCESS');
+    assert.strictEqual(res.candidates.length, 1);
+    assert.strictEqual(res.candidates[0].verificationStatus, 'PARTIAL');
+    assert.strictEqual(res.candidates[0].sourceUrl, pdfUrl);
+    assert.strictEqual(res.candidates[0].semester1StartDate, undefined);
+    assert.strictEqual(res.candidates[0].semester1EndDate, undefined);
+    assert.strictEqual(res.candidates[0].semester2StartDate, undefined);
+    assert.strictEqual(res.candidates[0].semester2EndDate, undefined);
+  });
+
+  // TEST AX: PDF text extraction — Fixture PDF text extracts semester boundaries
+  await runTest('AX. PDF text extraction: Official PDF with extracted text successfully extracts semester boundaries', async () => {
+    const pdfUrl = 'https://disdik.tangerangkota.go.id/dokumen/kaldik-2026-2027.pdf';
+
+    // Generate in-memory PDF fixture with jsPDF
+    const doc = new jsPDF();
+    doc.text('Kalender Pendidikan Tahun Pelajaran 2026/2027 Kota Tangerang.', 10, 10);
+    doc.text('Semester Ganjil dimulai 13 Juli 2026 dan berakhir 18 Desember 2026.', 10, 20);
+    const pdfArrayBuffer = doc.output('arraybuffer');
+
+    // Extract text deterministically using extractTextFromPdfBuffer
+    const extractedText = await extractTextFromPdfBuffer(pdfArrayBuffer);
+    assert.ok(extractedText.includes('13 Juli 2026'));
+
+    const provider = new TrustedCalendarSearchProvider({
+      discoverCandidateUrls: async () => [pdfUrl],
+      fetchSourceContent: async (url) => ({
+        ok: true,
+        status: 200,
+        text: extractedText,
+        rawHtml: '',
+        finalUrl: pdfUrl,
+        contentType: 'application/pdf',
+        isPdf: true,
+      }),
+      generatePlainContent: async () => ({
+        text: JSON.stringify([
+          {
+            province: 'Banten',
+            regency: 'Kota Tangerang',
+            academicYear: '2026/2027',
+            authority: 'Dinas Pendidikan Kota Tangerang',
+            documentTitle: 'Kaldik Kota Tangerang 2026/2027',
+            semester1StartDate: '2026-07-13',
+            semester1EndDate: '2026-12-18',
+          },
+        ]),
+      }),
+    });
+
+    const res = await provider.searchWithDiagnostics({
+      academicYear: '2026/2027',
+      province: 'Banten',
+      regency: 'Kota Tangerang',
+    });
+
+    assert.strictEqual(res.diagnostic.reason, 'SUCCESS');
+    assert.strictEqual(res.candidates.length, 1);
+    assert.strictEqual(res.candidates[0].semester1StartDate, '2026-07-13');
+    assert.strictEqual(res.candidates[0].semester1EndDate, '2026-12-18');
+  });
+
+  // TEST BA: Event extraction — Verified event in sourceText is extracted into candidate.events
+  await runTest('BA. Event extraction: Event explicitly present in sourceText is extracted and validated', async () => {
+    const verifiedUrl = 'https://disdik.tangerangkota.go.id/kaldik-2026-2027';
+
+    const provider = new TrustedCalendarSearchProvider({
+      discoverCandidateUrls: async () => [verifiedUrl],
+      fetchSourceContent: async (url) => ({
+        ok: true,
+        status: 200,
+        text: 'Kalender Pendidikan Tahun Pelajaran 2026/2027 Kota Tangerang. Libur Semester Ganjil tanggal 21 Desember 2026 sampai 3 Januari 2027.',
+        rawHtml: '',
+        finalUrl: verifiedUrl,
+        contentType: 'text/html',
+        isPdf: false,
+      }),
+      generatePlainContent: async () => ({
+        text: JSON.stringify([
+          {
+            province: 'Banten',
+            regency: 'Kota Tangerang',
+            academicYear: '2026/2027',
+            authority: 'Dinas Pendidikan Kota Tangerang',
+            documentTitle: 'Kaldik Kota Tangerang 2026/2027',
+            events: [
+              {
+                name: 'Libur Semester Ganjil',
+                startDate: '2026-12-21',
+                endDate: '2027-01-03',
+                category: 'SEMESTER_BREAK',
+              },
+            ],
+          },
+        ]),
+      }),
+    });
+
+    const res = await provider.searchWithDiagnostics({
+      academicYear: '2026/2027',
+      province: 'Banten',
+      regency: 'Kota Tangerang',
+    });
+
+    assert.strictEqual(res.candidates.length, 1);
+    assert.ok(Array.isArray(res.candidates[0].events));
+    assert.strictEqual(res.candidates[0].events?.length, 1);
+    assert.strictEqual(res.candidates[0].events?.[0].name, 'Libur Semester Ganjil');
+    assert.strictEqual(res.candidates[0].events?.[0].startDate, '2026-12-21');
+    assert.strictEqual(res.candidates[0].events?.[0].endDate, '2027-01-03');
+    assert.strictEqual(res.candidates[0].events?.[0].category, 'SEMESTER_BREAK');
+  });
+
+  // TEST BB: Hallucinated event rejection — Event with dates not in sourceText is discarded
+  await runTest('BB. Hallucinated event rejection: AI event with fabricated dates is discarded', async () => {
+    const verifiedUrl = 'https://disdik.tangerangkota.go.id/kaldik-2026-2027';
+
+    const provider = new TrustedCalendarSearchProvider({
+      discoverCandidateUrls: async () => [verifiedUrl],
+      fetchSourceContent: async (url) => ({
+        ok: true,
+        status: 200,
+        text: 'Kalender Pendidikan Tahun Ajaran 2026/2027 Kota Tangerang.',
+        rawHtml: '',
+        finalUrl: verifiedUrl,
+        contentType: 'text/html',
+        isPdf: false,
+      }),
+      generatePlainContent: async () => ({
+        text: JSON.stringify([
+          {
+            province: 'Banten',
+            regency: 'Kota Tangerang',
+            academicYear: '2026/2027',
+            authority: 'Dinas Pendidikan Kota Tangerang',
+            documentTitle: 'Kaldik Kota Tangerang 2026/2027',
+            events: [
+              {
+                name: 'Libur Semester',
+                startDate: '2026-12-21',
+                endDate: '2027-01-03',
+                category: 'SEMESTER_BREAK',
+              },
+            ],
+          },
+        ]),
+      }),
+    });
+
+    const res = await provider.searchWithDiagnostics({
+      academicYear: '2026/2027',
+      province: 'Banten',
+      regency: 'Kota Tangerang',
+    });
+
+    assert.strictEqual(res.candidates.length, 1);
+    assert.strictEqual(res.candidates[0].events, undefined, 'Hallucinated events must be discarded');
+  });
+
+  // TEST BF: SPMB false positive rejected
+  await runTest('BF. SPMB false positive rejected: Official SPMB portal without calendar keywords is rejected', async () => {
+    const spmbUrl = 'https://spmb.tangerangkota.go.id/';
+    const spmbText = 'Website Resmi Sistem Penerimaan Murid Baru Kota Tangerang. SPMB Tahun Ajaran 2026/2027. Informasi jalur pendaftaran, daya tampung, dan hasil seleksi.';
+
+    const verification = verifySourceContentRelevance(
+      spmbText,
+      spmbUrl,
+      { academicYear: '2026/2027', province: 'Banten', regency: 'Kota Tangerang' },
+      'REGENCY'
+    );
+    assert.strictEqual(verification.isValid, false);
+    assert.strictEqual(verification.hasStrongCalendarEvidence, false);
+    assert.strictEqual(verification.hasNegativeEducationAdmissionEvidence, true);
+    assert.strictEqual(verification.rejectionReason, 'NON_CALENDAR_EDUCATION_PAGE');
+  });
+
+  // TEST BG: PPDB false positive rejected
+  await runTest('BG. PPDB false positive rejected: PPDB portal is rejected due to missing strong calendar evidence', async () => {
+    const ppdbUrl = 'https://ppdb.kotax.go.id/';
+    const ppdbText = 'PPDB Kota X Tahun Pelajaran 2026/2027 Jalur Zonasi Jalur Afirmasi Pendaftaran Peserta Didik Baru';
+
+    const verification = verifySourceContentRelevance(
+      ppdbText,
+      ppdbUrl,
+      { academicYear: '2026/2027', province: 'Jawa Barat', regency: 'Kota X' },
+      'REGENCY'
+    );
+    assert.strictEqual(verification.isValid, false);
+    assert.strictEqual(verification.hasStrongCalendarEvidence, false);
+    assert.strictEqual(verification.hasNegativeEducationAdmissionEvidence, true);
+  });
+
+  // TEST BH: Weak evidence alone rejected
+  await runTest('BH. Weak evidence alone rejected: Page with weak calendar terms but no strong evidence is rejected', async () => {
+    const genericUrl = 'https://disdik.tangerangkota.go.id/agenda-kegiatan';
+    const genericText = 'Tahun Ajaran 2026/2027 Semester Ganjil Hari Pertama Masuk Sekolah Kota Tangerang';
+
+    const verification = verifySourceContentRelevance(
+      genericText,
+      genericUrl,
+      { academicYear: '2026/2027', province: 'Banten', regency: 'Kota Tangerang' },
+      'REGENCY'
+    );
+    assert.strictEqual(verification.isValid, false);
+    assert.strictEqual(verification.hasStrongCalendarEvidence, false);
+    assert.strictEqual(verification.hasWeakCalendarEvidence, true);
+    assert.strictEqual(verification.rejectionReason, 'MISSING_STRONG_CALENDAR_EVIDENCE');
+  });
+
+  // TEST BI: Real calendar accepted
+  await runTest('BI. Real calendar accepted: Document with strong calendar evidence is accepted', async () => {
+    const kaldikUrl = 'https://disdik.tangerangkota.go.id/pedoman-kaldik-2026-2027';
+    const kaldikText = 'Pedoman Kalender Pendidikan Tahun Ajaran 2026/2027 Kota Tangerang Semester Ganjil dimulai 13 Juli 2026';
+
+    const verification = verifySourceContentRelevance(
+      kaldikText,
+      kaldikUrl,
+      { academicYear: '2026/2027', province: 'Banten', regency: 'Kota Tangerang' },
+      'REGENCY'
+    );
+    assert.strictEqual(verification.isValid, true);
+    assert.strictEqual(verification.hasStrongCalendarEvidence, true);
+  });
+
+  // TEST BJ: Calendar document containing admission reference still accepted
+  await runTest('BJ. Strong evidence overrides admission terms: Calendar document mentioning PPDB/SPMB is accepted', async () => {
+    const kaldikUrl = 'https://disdik.tangerangkota.go.id/kaldik-2026-2027';
+    const kaldikText = 'Kalender Pendidikan Tahun Ajaran 2026/2027 Kota Tangerang. Masa penerimaan murid baru dilaksanakan pada bulan Juni.';
+
+    const verification = verifySourceContentRelevance(
+      kaldikText,
+      kaldikUrl,
+      { academicYear: '2026/2027', province: 'Banten', regency: 'Kota Tangerang' },
+      'REGENCY'
+    );
+    assert.strictEqual(verification.isValid, true);
+    assert.strictEqual(verification.hasStrongCalendarEvidence, true);
+    assert.strictEqual(verification.hasNegativeEducationAdmissionEvidence, true);
+  });
+
+  // TEST BK: Reject SPMB then continue candidate search
+  await runTest('BK. Candidate continuation: SPMB candidate is rejected, search continues to next candidate', async () => {
+    const spmbUrl = 'https://spmb.examplekota.go.id';
+    const kaldikUrl = 'https://disdik.examplekota.go.id/kaldik-2026-2027';
+
+    const provider = new TrustedCalendarSearchProvider({
+      discoverCandidateUrls: async () => [spmbUrl, kaldikUrl],
+      fetchSourceContent: async (url) => {
+        if (url === spmbUrl) {
+          return {
+            ok: true,
+            status: 200,
+            text: 'Website Resmi Sistem Penerimaan Murid Baru Online Kota Tangerang Tahun Ajaran 2026/2027.',
+            rawHtml: '',
+            finalUrl: spmbUrl,
+            contentType: 'text/html',
+            isPdf: false,
+          };
+        }
+        if (url === kaldikUrl) {
+          return {
+            ok: true,
+            status: 200,
+            text: 'Pedoman Kalender Pendidikan Tahun Ajaran 2026/2027 Kota Tangerang resmi.',
+            rawHtml: '',
+            finalUrl: kaldikUrl,
+            contentType: 'text/html',
+            isPdf: false,
+          };
+        }
+        return null;
+      },
+      generatePlainContent: async () => ({
+        text: JSON.stringify([
+          {
+            province: 'Banten',
+            regency: 'Kota Tangerang',
+            academicYear: '2026/2027',
+            authority: 'Dinas Pendidikan Kota Tangerang',
+            documentTitle: 'Pedoman Kalender Pendidikan 2026/2027',
+          },
+        ]),
+      }),
+    });
+
+    const res = await provider.searchWithDiagnostics({
+      academicYear: '2026/2027',
+      province: 'Banten',
+      regency: 'Kota Tangerang',
+    });
+
+    assert.strictEqual(res.diagnostic.reason, 'SUCCESS');
+    assert.strictEqual(res.candidates.length, 1);
+    assert.strictEqual(res.candidates[0].sourceUrl, kaldikUrl, 'Must select candidate #2 after candidate #1 SPMB is rejected');
+  });
+
+  // TEST BL: Regency false positives all rejected -> Province fallback
+  await runTest('BL. Province fallback: All REGENCY candidates rejected for non-calendar content -> falls back to PROVINCE', async () => {
+    const regencySpmbUrl = 'https://spmb.tangerangkota.go.id';
+    const provinceKaldikUrl = 'https://dindikbud.bantenprov.go.id/kaldik-2026-2027';
+
+    const provider = new TrustedCalendarSearchProvider({
+      discoverCandidateUrls: async (_req, level) => {
+        if (level === 'REGENCY') return [regencySpmbUrl];
+        if (level === 'PROVINCE') return [provinceKaldikUrl];
+        return [];
+      },
+      fetchSourceContent: async (url) => {
+        if (url === regencySpmbUrl) {
+          return {
+            ok: true,
+            status: 200,
+            text: 'Website Resmi Sistem Penerimaan Murid Baru Online Kota Tangerang Tahun Ajaran 2026/2027.',
+            rawHtml: '',
+            finalUrl: regencySpmbUrl,
+            contentType: 'text/html',
+            isPdf: false,
+          };
+        }
+        if (url === provinceKaldikUrl) {
+          return {
+            ok: true,
+            status: 200,
+            text: 'Keputusan Kepala Dinas Pendidikan dan Kebudayaan Provinsi Banten tentang Kalender Pendidikan Tahun Pelajaran 2026/2027.',
+            rawHtml: '',
+            finalUrl: provinceKaldikUrl,
+            contentType: 'text/html',
+            isPdf: false,
+          };
+        }
+        return null;
+      },
+      generatePlainContent: async () => ({
+        text: JSON.stringify([
+          {
+            province: 'Banten',
+            academicYear: '2026/2027',
+            authority: 'Dinas Pendidikan dan Kebudayaan Provinsi Banten',
+            documentTitle: 'Kaldik Provinsi Banten 2026/2027',
+          },
+        ]),
+      }),
+    });
+
+    const res = await provider.searchWithDiagnostics({
+      academicYear: '2026/2027',
+      province: 'Banten',
+      regency: 'Kota Tangerang',
+    });
+
+    assert.strictEqual(res.diagnostic.reason, 'SUCCESS');
+    assert.strictEqual(res.candidates.length, 1);
+    assert.strictEqual(res.candidates[0].sourceLevel, 'PROVINCE');
+    assert.strictEqual(res.candidates[0].sourceUrl, provinceKaldikUrl);
+  });
+
+  // TEST BM: Strong calendar evidence must come from content, not URL
+  await runTest('BM. Strong evidence content-only: URL with /kaldik but non-calendar content is rejected', async () => {
+    const url = 'https://disdik.examplekota.go.id/kaldik-2026-2027';
+    const text = 'Informasi umum Dinas Pendidikan Kota Example. Tahun Ajaran 2026/2027.';
+
+    const verification = verifySourceContentRelevance(
+      text,
+      url,
+      { academicYear: '2026/2027', province: 'Banten', regency: 'Kota Example' },
+      'REGENCY'
+    );
+    assert.strictEqual(verification.isValid, false);
+    assert.strictEqual(verification.hasStrongCalendarEvidence, false);
+    assert.strictEqual(verification.rejectionReason, 'MISSING_STRONG_CALENDAR_EVIDENCE');
+  });
+
+  // TEST BN: Event wrong semantic label rejected
+  await runTest('BN. Semantic event validation: AI claiming "Libur Semester" for "Asesmen Sumatif" is discarded', async () => {
+    const verifiedUrl = 'https://disdik.tangerangkota.go.id/kaldik-2026-2027';
+    const sourceText = 'Kalender Pendidikan Tahun Ajaran 2026/2027 Kota Tangerang. Asesmen Sumatif tanggal 10 Desember 2026.';
+
+    const provider = new TrustedCalendarSearchProvider({
+      discoverCandidateUrls: async () => [verifiedUrl],
+      fetchSourceContent: async () => ({
+        ok: true,
+        status: 200,
+        text: sourceText,
+        finalUrl: verifiedUrl,
+        contentType: 'text/html',
+        isPdf: false,
+      }),
+      generatePlainContent: async () => ({
+        text: JSON.stringify([
+          {
+            province: 'Banten',
+            regency: 'Kota Tangerang',
+            academicYear: '2026/2027',
+            authority: 'Dinas Pendidikan Kota Tangerang',
+            documentTitle: 'Kaldik Kota Tangerang 2026/2027',
+            events: [
+              {
+                name: 'Libur Semester',
+                startDate: '2026-12-10',
+                category: 'SEMESTER_BREAK',
+              },
+            ],
+          },
+        ]),
+      }),
+    });
+
+    const res = await provider.searchWithDiagnostics({
+      academicYear: '2026/2027',
+      province: 'Banten',
+      regency: 'Kota Tangerang',
+    });
+
+    assert.strictEqual(res.candidates.length, 1);
+    assert.strictEqual(res.candidates[0].events, undefined, 'Event with conflicting semantic name must be discarded');
+  });
+
+  // TEST BO: Event category derived from source evidence overrides incorrect AI category
+  await runTest('BO. Category derivation: Source "Asesmen Sumatif" overrides AI category "HOLIDAY" -> "ASSESSMENT"', async () => {
+    const verifiedUrl = 'https://disdik.tangerangkota.go.id/kaldik-2026-2027';
+    const sourceText = 'Kalender Pendidikan Tahun Ajaran 2026/2027 Kota Tangerang. Asesmen Sumatif tanggal 10 Desember 2026.';
+
+    const provider = new TrustedCalendarSearchProvider({
+      discoverCandidateUrls: async () => [verifiedUrl],
+      fetchSourceContent: async () => ({
+        ok: true,
+        status: 200,
+        text: sourceText,
+        finalUrl: verifiedUrl,
+        contentType: 'text/html',
+        isPdf: false,
+      }),
+      generatePlainContent: async () => ({
+        text: JSON.stringify([
+          {
+            province: 'Banten',
+            regency: 'Kota Tangerang',
+            academicYear: '2026/2027',
+            authority: 'Dinas Pendidikan Kota Tangerang',
+            documentTitle: 'Kaldik Kota Tangerang 2026/2027',
+            events: [
+              {
+                name: 'Asesmen Sumatif',
+                startDate: '2026-12-10',
+                category: 'HOLIDAY',
+              },
+            ],
+          },
+        ]),
+      }),
+    });
+
+    const res = await provider.searchWithDiagnostics({
+      academicYear: '2026/2027',
+      province: 'Banten',
+      regency: 'Kota Tangerang',
+    });
+
+    assert.strictEqual(res.candidates.length, 1);
+    assert.ok(Array.isArray(res.candidates[0].events));
+    assert.strictEqual(res.candidates[0].events?.length, 1);
+    assert.strictEqual(res.candidates[0].events?.[0].name, 'Asesmen Sumatif');
+    assert.strictEqual(res.candidates[0].events?.[0].category, 'ASSESSMENT', 'Must correct AI category to ASSESSMENT');
+  });
+
+  // TEST BP: Valid semester break accepted and categorized
+  await runTest('BP. Valid semester break: "Libur Semester Ganjil" accepted with category SEMESTER_BREAK', async () => {
+    const verifiedUrl = 'https://disdik.tangerangkota.go.id/kaldik-2026-2027';
+    const sourceText = 'Kalender Pendidikan Tahun Ajaran 2026/2027 Kota Tangerang. Libur Semester Ganjil mulai 21 Desember 2026 sampai 3 Januari 2027.';
+
+    const provider = new TrustedCalendarSearchProvider({
+      discoverCandidateUrls: async () => [verifiedUrl],
+      fetchSourceContent: async () => ({
+        ok: true,
+        status: 200,
+        text: sourceText,
+        finalUrl: verifiedUrl,
+        contentType: 'text/html',
+        isPdf: false,
+      }),
+      generatePlainContent: async () => ({
+        text: JSON.stringify([
+          {
+            province: 'Banten',
+            regency: 'Kota Tangerang',
+            academicYear: '2026/2027',
+            authority: 'Dinas Pendidikan Kota Tangerang',
+            documentTitle: 'Kaldik Kota Tangerang 2026/2027',
+            events: [
+              {
+                name: 'Libur Semester Ganjil',
+                startDate: '2026-12-21',
+                endDate: '2027-01-03',
+                category: 'SEMESTER_BREAK',
+              },
+            ],
+          },
+        ]),
+      }),
+    });
+
+    const res = await provider.searchWithDiagnostics({
+      academicYear: '2026/2027',
+      province: 'Banten',
+      regency: 'Kota Tangerang',
+    });
+
+    assert.strictEqual(res.candidates.length, 1);
+    assert.ok(Array.isArray(res.candidates[0].events));
+    assert.strictEqual(res.candidates[0].events?.length, 1);
+    assert.strictEqual(res.candidates[0].events?.[0].category, 'SEMESTER_BREAK');
+  });
+
+  // TEST BQ: PDF Content-Length Guard (> 10 MB)
+  await runTest('BQ. PDF Content-Length guard: PDF with Content-Length > 10 MB returns metadata-only without reading body', async () => {
+    const largePdfUrl = 'https://disdik.tangerangkota.go.id/dokumen/large-calendar.pdf';
+    let streamOrArrayBufferInvoked = false;
+
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async () => {
+      return {
+        ok: true,
+        status: 200,
+        url: largePdfUrl,
+        headers: new Headers({
+          'content-type': 'application/pdf',
+          'content-length': '15728640', // 15 MB
+        }),
+        arrayBuffer: async () => {
+          streamOrArrayBufferInvoked = true;
+          return new ArrayBuffer(0);
+        },
+        body: {
+          getReader: () => {
+            streamOrArrayBufferInvoked = true;
+            throw new Error('Should not invoke stream reader when Content-Length exceeds limit');
+          },
+        },
+      } as any;
+    };
+
+    try {
+      const fetched = await defaultSourceContentFetcher(largePdfUrl);
+      assert.ok(fetched);
+      assert.strictEqual(fetched.ok, true);
+      assert.strictEqual(fetched.isPdf, true);
+      assert.strictEqual(fetched.text, '', 'Text must be empty for oversized PDF');
+      assert.strictEqual(streamOrArrayBufferInvoked, false, 'Body stream or arrayBuffer must not be invoked');
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  // TEST BR: Stream Hard Limit (without Content-Length header, chunks > 10 MB)
+  await runTest('BR. Stream hard limit: Stream exceeding 10 MB is cancelled and returns metadata-only', async () => {
+    let readerCancelled = false;
+    const chunkSize = 4 * 1024 * 1024; // 4 MB chunks
+    let chunkCount = 0;
+
+    const mockStream = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        if (chunkCount >= 4) {
+          controller.close();
+          return;
+        }
+        chunkCount++;
+        controller.enqueue(new Uint8Array(chunkSize));
+      },
+      cancel() {
+        readerCancelled = true;
+      },
+    });
+
+    const result = await readBoundedStream(mockStream, 10 * 1024 * 1024);
+    assert.strictEqual(result.exceeded, true, 'Must report exceeded: true');
+    assert.strictEqual(result.buffer, null, 'Buffer must be null on exceed');
+    assert.strictEqual(readerCancelled, true, 'Stream reader must be cancelled');
+  });
+
+  // TEST BS: Assessment priority over semester break ("Asesmen Sumatif Akhir Semester" -> ASSESSMENT)
+  await runTest('BS. Assessment priority: "Asesmen Sumatif Akhir Semester" mapped to ASSESSMENT despite AI SEMESTER_BREAK hint', async () => {
+    const verifiedUrl = 'https://disdik.tangerangkota.go.id/kaldik-2026-2027';
+    const sourceText = 'Kalender Pendidikan Tahun Ajaran 2026/2027.\nAsesmen Sumatif Akhir Semester dilaksanakan tanggal 10 Desember 2026.';
+
+    const provider = new TrustedCalendarSearchProvider({
+      discoverCandidateUrls: async () => [verifiedUrl],
+      fetchSourceContent: async () => ({
+        ok: true,
+        status: 200,
+        text: sourceText,
+        finalUrl: verifiedUrl,
+        contentType: 'text/html',
+        isPdf: false,
+      }),
+      generatePlainContent: async () => ({
+        text: JSON.stringify([
+          {
+            province: 'Banten',
+            regency: 'Kota Tangerang',
+            academicYear: '2026/2027',
+            authority: 'Dinas Pendidikan Kota Tangerang',
+            documentTitle: 'Kaldik Kota Tangerang 2026/2027',
+            events: [
+              {
+                name: 'Asesmen Sumatif Akhir Semester',
+                startDate: '2026-12-10',
+                category: 'SEMESTER_BREAK',
+              },
+            ],
+          },
+        ]),
+      }),
+    });
+
+    const res = await provider.searchWithDiagnostics({
+      academicYear: '2026/2027',
+      province: 'Banten',
+      regency: 'Kota Tangerang',
+    });
+
+    assert.strictEqual(res.candidates.length, 1);
+    assert.ok(Array.isArray(res.candidates[0].events));
+    assert.strictEqual(res.candidates[0].events?.length, 1);
+    assert.strictEqual(res.candidates[0].events?.[0].name, 'Asesmen Sumatif Akhir Semester');
+    assert.strictEqual(res.candidates[0].events?.[0].category, 'ASSESSMENT', 'Must map to ASSESSMENT');
+  });
+
+  // TEST BT: Neutral semantic evidence falls back to OTHER (AI category is not an authority)
+  await runTest('BT. Neutral semantic evidence falls back to OTHER even if AI outputs HOLIDAY', async () => {
+    const verifiedUrl = 'https://disdik.tangerangkota.go.id/kaldik-2026-2027';
+    const sourceText = 'Kalender Pendidikan Tahun Ajaran 2026/2027.\nKegiatan dilaksanakan tanggal 10 Desember 2026.';
+
+    const provider = new TrustedCalendarSearchProvider({
+      discoverCandidateUrls: async () => [verifiedUrl],
+      fetchSourceContent: async () => ({
+        ok: true,
+        status: 200,
+        text: sourceText,
+        finalUrl: verifiedUrl,
+        contentType: 'text/html',
+        isPdf: false,
+      }),
+      generatePlainContent: async () => ({
+        text: JSON.stringify([
+          {
+            province: 'Banten',
+            regency: 'Kota Tangerang',
+            academicYear: '2026/2027',
+            authority: 'Dinas Pendidikan Kota Tangerang',
+            documentTitle: 'Kaldik Kota Tangerang 2026/2027',
+            events: [
+              {
+                name: 'Kegiatan',
+                startDate: '2026-12-10',
+                category: 'HOLIDAY',
+              },
+            ],
+          },
+        ]),
+      }),
+    });
+
+    const res = await provider.searchWithDiagnostics({
+      academicYear: '2026/2027',
+      province: 'Banten',
+      regency: 'Kota Tangerang',
+    });
+
+    assert.strictEqual(res.candidates.length, 1);
+    assert.ok(Array.isArray(res.candidates[0].events));
+    assert.strictEqual(res.candidates[0].events?.length, 1);
+    assert.strictEqual(res.candidates[0].events?.[0].name, 'Kegiatan');
+    assert.strictEqual(res.candidates[0].events?.[0].category, 'OTHER', 'Must fall back to OTHER when no semantic evidence exists');
+  });
+
+  // TEST BU: Seed candidate rejected, AI fallback succeeds
+  await runTest('BU. Seed candidate rejected: Rejected seed discovery triggers Plain Gemini fallback and succeeds', async () => {
+    const spmbUrl = 'https://spmb.examplekota.go.id';
+    const validAiUrl = 'https://disdik.examplekota.go.id/kaldik-2026-2027';
+    let aiDiscoveryCalled = false;
+
+    const provider = new TrustedCalendarSearchProvider({
+      discoverCandidateUrls: async () => [spmbUrl],
+      fetchSourceContent: async (url) => {
+        if (url === spmbUrl) {
+          return {
+            ok: true,
+            status: 200,
+            text: 'Website Resmi Sistem Penerimaan Murid Baru Online Kota Example Tahun Ajaran 2026/2027.',
+            rawHtml: '',
+            finalUrl: spmbUrl,
+            contentType: 'text/html',
+            isPdf: false,
+          };
+        }
+        if (url === validAiUrl) {
+          return {
+            ok: true,
+            status: 200,
+            text: 'Pedoman Kalender Pendidikan Tahun Ajaran 2026/2027 Kota Example resmi.',
+            rawHtml: '',
+            finalUrl: validAiUrl,
+            contentType: 'text/html',
+            isPdf: false,
+          };
+        }
+        return null;
+      },
+      generatePlainContent: async (prompt) => {
+        if (prompt.includes('Sebutkan 3-6 URL resmi')) {
+          aiDiscoveryCalled = true;
+          return { text: JSON.stringify([validAiUrl]) };
+        }
+        return {
+          text: JSON.stringify([
+            {
+              province: 'Banten',
+              regency: 'Kota Example',
+              academicYear: '2026/2027',
+              authority: 'Dinas Pendidikan Kota Example',
+              documentTitle: 'Pedoman Kalender Pendidikan 2026/2027',
+            },
+          ]),
+        };
+      },
+    });
+
+    const res = await provider.searchWithDiagnostics({
+      academicYear: '2026/2027',
+      province: 'Banten',
+      regency: 'Kota Example',
+    });
+
+    assert.strictEqual(res.diagnostic.reason, 'SUCCESS');
+    assert.strictEqual(res.candidates.length, 1);
+    assert.strictEqual(res.candidates[0].sourceUrl, validAiUrl);
+    assert.strictEqual(aiDiscoveryCalled, true, 'Gemini URL discovery must be invoked after seed candidate rejection');
+    assert.ok(
+      res.diagnostic.stages[0].modelAttempts.some((m) => m.status === 'SUCCESS'),
+      'modelAttempts must contain Gemini attempt'
+    );
+  });
+
+  // TEST BV: Deterministic/seed candidate valid, AI not called
+  await runTest('BV. Seed candidate valid: Valid initial candidate short-circuits before Gemini URL discovery', async () => {
+    const validSeedUrl = 'https://disdik.examplekota.go.id/kaldik-2026-2027';
+    let aiDiscoveryCalled = false;
+
+    const provider = new TrustedCalendarSearchProvider({
+      discoverCandidateUrls: async () => [validSeedUrl],
+      fetchSourceContent: async (url) => {
+        if (url === validSeedUrl) {
+          return {
+            ok: true,
+            status: 200,
+            text: 'Pedoman Kalender Pendidikan Tahun Ajaran 2026/2027 Kota Example resmi.',
+            rawHtml: '',
+            finalUrl: validSeedUrl,
+            contentType: 'text/html',
+            isPdf: false,
+          };
+        }
+        return null;
+      },
+      generatePlainContent: async (prompt) => {
+        if (prompt.includes('Sebutkan 3-6 URL resmi')) {
+          aiDiscoveryCalled = true;
+          return { text: JSON.stringify(['https://disdik.examplekota.go.id/other']) };
+        }
+        return {
+          text: JSON.stringify([
+            {
+              province: 'Banten',
+              regency: 'Kota Example',
+              academicYear: '2026/2027',
+              authority: 'Dinas Pendidikan Kota Example',
+              documentTitle: 'Pedoman Kalender Pendidikan 2026/2027',
+            },
+          ]),
+        };
+      },
+    });
+
+    const res = await provider.searchWithDiagnostics({
+      academicYear: '2026/2027',
+      province: 'Banten',
+      regency: 'Kota Example',
+    });
+
+    assert.strictEqual(res.diagnostic.reason, 'SUCCESS');
+    assert.strictEqual(res.candidates.length, 1);
+    assert.strictEqual(res.candidates[0].sourceUrl, validSeedUrl);
+    assert.strictEqual(aiDiscoveryCalled, false, 'Gemini URL discovery MUST NOT be invoked when initial candidate is valid');
+  });
+
+  // TEST BW: AI duplicate URL not refetched
+  await runTest('BW. Duplicate URL protection: Previously attempted rejected candidate URL from initial pass is not refetched during AI pass', async () => {
+    const urlA = 'https://spmb.examplekota.go.id';
+    const urlB = 'https://disdik.examplekota.go.id/kaldik-2026-2027';
+    const fetchCounts: Record<string, number> = {};
+
+    const provider = new TrustedCalendarSearchProvider({
+      discoverCandidateUrls: async () => [urlA],
+      fetchSourceContent: async (url) => {
+        fetchCounts[url] = (fetchCounts[url] || 0) + 1;
+        if (url === urlA) {
+          return {
+            ok: true,
+            status: 200,
+            text: 'Website Resmi Sistem Penerimaan Murid Baru Online Kota Example Tahun Ajaran 2026/2027.',
+            rawHtml: '',
+            finalUrl: urlA,
+            contentType: 'text/html',
+            isPdf: false,
+          };
+        }
+        if (url === urlB) {
+          return {
+            ok: true,
+            status: 200,
+            text: 'Pedoman Kalender Pendidikan Tahun Ajaran 2026/2027 Kota Example resmi.',
+            rawHtml: '',
+            finalUrl: urlB,
+            contentType: 'text/html',
+            isPdf: false,
+          };
+        }
+        return null;
+      },
+      generatePlainContent: async (prompt) => {
+        if (prompt.includes('Sebutkan 3-6 URL resmi')) {
+          return { text: JSON.stringify([urlA, urlB]) };
+        }
+        return {
+          text: JSON.stringify([
+            {
+              province: 'Banten',
+              regency: 'Kota Example',
+              academicYear: '2026/2027',
+              authority: 'Dinas Pendidikan Kota Example',
+              documentTitle: 'Pedoman Kalender Pendidikan 2026/2027',
+            },
+          ]),
+        };
+      },
+    });
+
+    const res = await provider.searchWithDiagnostics({
+      academicYear: '2026/2027',
+      province: 'Banten',
+      regency: 'Kota Example',
+    });
+
+    assert.strictEqual(res.diagnostic.reason, 'SUCCESS');
+    assert.strictEqual(res.candidates.length, 1);
+    assert.strictEqual(res.candidates[0].sourceUrl, urlB);
+    assert.strictEqual(fetchCounts[urlA], 1, 'URL A must be fetched exactly once (not refetched in AI pass)');
+    assert.strictEqual(fetchCounts[urlB], 1, 'URL B evaluated and fetched once');
+  });
+
+  // TEST BX: National rejected initial URL triggers AI fallback
+  await runTest('BX. National stage fallback: Rejected initial NATIONAL source triggers Plain Gemini URL discovery', async () => {
+    const nationalInitialUrl = 'https://kemdikbud.go.id/kalender-pendidikan-2026-2027';
+    const nationalAiUrl = 'https://kemendikdasmen.go.id/pedoman-kalender-pendidikan-2026-2027';
+    let nationalAiDiscoveryCalled = false;
+
+    const provider = new TrustedCalendarSearchProvider({
+      discoverCandidateUrls: async (_req, level) => {
+        if (level === 'NATIONAL') {
+          return [nationalInitialUrl];
+        }
+        return [];
+      },
+      fetchSourceContent: async (url) => {
+        if (url === nationalInitialUrl) {
+          return {
+            ok: true,
+            status: 200,
+            text: 'Halaman Berita Utama Kemdikbud Tahun Ajaran 2026/2027.',
+            rawHtml: '',
+            finalUrl: nationalInitialUrl,
+            contentType: 'text/html',
+            isPdf: false,
+          };
+        }
+        if (url === nationalAiUrl) {
+          return {
+            ok: true,
+            status: 200,
+            text: 'Pedoman Standar Kalender Pendidikan Tahun Ajaran 2026/2027 Nasional Kemendikdasmen RI.',
+            rawHtml: '',
+            finalUrl: nationalAiUrl,
+            contentType: 'text/html',
+            isPdf: false,
+          };
+        }
+        return null;
+      },
+      generatePlainContent: async (prompt) => {
+        if (prompt.includes('Sebutkan 3-6 URL resmi')) {
+          nationalAiDiscoveryCalled = true;
+          return { text: JSON.stringify([nationalAiUrl]) };
+        }
+        return {
+          text: JSON.stringify([
+            {
+              academicYear: '2026/2027',
+              authority: 'Kementerian Pendidikan Dasar dan Menengah RI',
+              documentTitle: 'Pedoman Standar Kalender Pendidikan 2026/2027',
+            },
+          ]),
+        };
+      },
+    });
+
+    const res = await provider.searchWithDiagnostics({
+      academicYear: '2026/2027',
+    });
+
+    assert.strictEqual(res.diagnostic.reason, 'SUCCESS');
+    assert.strictEqual(res.candidates.length, 1);
+    assert.strictEqual(res.candidates[0].sourceLevel, 'NATIONAL');
+    assert.strictEqual(res.candidates[0].sourceUrl, nationalAiUrl);
+    assert.strictEqual(nationalAiDiscoveryCalled, true, 'Plain Gemini discovery must run on NATIONAL stage when initial URL is rejected');
+  });
+
+  // =========================================================================
+  // CONTRACT REVISION TESTS: BROAD DISCOVERY & NATIONAL BASE (BY - CK)
+  // =========================================================================
+
+  // TEST BY: Exact-city NON_OFFICIAL valid accepted
+  await runTest('BY. Exact-city NON_OFFICIAL valid: Non-.go.id HTTPS source with strong evidence accepted with MEDIUM confidence', async () => {
+    const nonGovUrl = 'https://smkn1tangerang.sch.id/kaldik-2026-2027';
+    const sourceText = 'Kalender Pendidikan Tahun Ajaran 2026/2027 Kota Tangerang resmi berlaku. Semester 1 dimulai 13 Juli 2026.';
+
+    const provider = new TrustedCalendarSearchProvider({
+      discoverCandidateUrls: async () => [nonGovUrl],
+      fetchSourceContent: async (url) => ({
+        ok: true,
+        status: 200,
+        text: sourceText,
+        finalUrl: url,
+        contentType: 'text/html',
+        isPdf: false,
+      }),
+      generatePlainContent: async () => ({
+        text: JSON.stringify([
+          {
+            province: 'Banten',
+            regency: 'Kota Tangerang',
+            academicYear: '2026/2027',
+            authority: 'SMKN 1 Tangerang',
+            documentTitle: 'Kaldik Kota Tangerang 2026/2027',
+            semester1StartDate: '2026-07-13',
+          },
+        ]),
+      }),
+    });
+
+    const res = await provider.searchWithDiagnostics({
+      academicYear: '2026/2027',
+      province: 'Banten',
+      regency: 'Kota Tangerang',
+    });
+
+    assert.strictEqual(res.diagnostic.reason, 'SUCCESS');
+    assert.strictEqual(res.candidates.length, 1);
+    assert.strictEqual(res.candidates[0].sourceUrl, nonGovUrl);
+    assert.strictEqual(res.candidates[0].sourceLevel, 'REGENCY');
+    assert.strictEqual(res.candidates[0].authorityType, 'NON_OFFICIAL');
+    assert.strictEqual(res.candidates[0].confidence, 'MEDIUM');
+    assert.strictEqual(res.candidates[0].semester1StartDate, '2026-07-13');
+  });
+
+  // TEST BZ: Same-level OFFICIAL beats NON_OFFICIAL
+  await runTest('BZ. Same-level priority: REGENCY OFFICIAL beats REGENCY NON_OFFICIAL deterministically', () => {
+    const nonGovCandidate: CalendarSourceCandidate = {
+      sourceLevel: 'REGENCY',
+      authorityType: 'NON_OFFICIAL',
+      confidence: 'MEDIUM',
+      academicYear: '2026/2027',
+      province: 'Banten',
+      regency: 'Kota Tangerang',
+      authority: 'SMKN 1 Tangerang',
+      documentTitle: 'Kaldik Tangerang',
+      sourceUrl: 'https://smkn1tangerang.sch.id/kaldik',
+      verificationStatus: 'VERIFIED',
+      semesterStartDate: '2026-07-13',
+      semesterEndDate: '2026-12-18',
+      retrievedAt: new Date().toISOString(),
+    };
+
+    const govCandidate: CalendarSourceCandidate = {
+      sourceLevel: 'REGENCY',
+      authorityType: 'OFFICIAL',
+      confidence: 'HIGH',
+      academicYear: '2026/2027',
+      province: 'Banten',
+      regency: 'Kota Tangerang',
+      authority: 'Dinas Pendidikan Kota Tangerang',
+      documentTitle: 'Kaldik Resmi Kota Tangerang',
+      sourceUrl: 'https://disdik.tangerangkota.go.id/kaldik',
+      verificationStatus: 'VERIFIED',
+      semesterStartDate: '2026-07-13',
+      semesterEndDate: '2026-12-18',
+      retrievedAt: new Date().toISOString(),
+    };
+
+    const selected = selectBestCalendarSource([nonGovCandidate, govCandidate], {
+      academicYear: '2026/2027',
+      province: 'Banten',
+      regency: 'Kota Tangerang',
+    });
+
+    assert.ok(selected);
+    assert.strictEqual(selected.authorityType, 'OFFICIAL');
+    assert.strictEqual(selected.sourceUrl, 'https://disdik.tangerangkota.go.id/kaldik');
+  });
+
+  // TEST CA: REGENCY NON_OFFICIAL beats PROVINCE OFFICIAL
+  await runTest('CA. Hierarchy priority: REGENCY NON_OFFICIAL beats PROVINCE OFFICIAL', () => {
+    const regencyNonGov: CalendarSourceCandidate = {
+      sourceLevel: 'REGENCY',
+      authorityType: 'NON_OFFICIAL',
+      confidence: 'MEDIUM',
+      academicYear: '2026/2027',
+      province: 'Banten',
+      regency: 'Kota Tangerang',
+      authority: 'SMKN 1 Tangerang',
+      documentTitle: 'Kaldik Kota Tangerang',
+      sourceUrl: 'https://smkn1tangerang.sch.id/kaldik',
+      verificationStatus: 'VERIFIED',
+      semesterStartDate: '2026-07-13',
+      semesterEndDate: '2026-12-18',
+      retrievedAt: new Date().toISOString(),
+    };
+
+    const provinceGov: CalendarSourceCandidate = {
+      sourceLevel: 'PROVINCE',
+      authorityType: 'OFFICIAL',
+      confidence: 'HIGH',
+      academicYear: '2026/2027',
+      province: 'Banten',
+      authority: 'Dinas Pendidikan Provinsi Banten',
+      documentTitle: 'Kaldik Provinsi Banten',
+      sourceUrl: 'https://dindikbud.bantenprov.go.id/kaldik',
+      verificationStatus: 'VERIFIED',
+      semesterStartDate: '2026-07-13',
+      semesterEndDate: '2026-12-18',
+      retrievedAt: new Date().toISOString(),
+    };
+
+    const selected = selectBestCalendarSource([provinceGov, regencyNonGov], {
+      academicYear: '2026/2027',
+      province: 'Banten',
+      regency: 'Kota Tangerang',
+    });
+
+    assert.ok(selected);
+    assert.strictEqual(selected.sourceLevel, 'REGENCY');
+    assert.strictEqual(selected.authorityType, 'NON_OFFICIAL');
+    assert.strictEqual(selected.sourceUrl, 'https://smkn1tangerang.sch.id/kaldik');
+  });
+
+  // TEST CB: Kota Tangerang Selatan rejected for Kota Tangerang
+  await runTest('CB. Geography guard: Document exclusively for Kota Tangerang Selatan is rejected for Kota Tangerang', () => {
+    const textTangsel = 'Pemerintah Kota Tangerang Selatan. Pedoman Kalender Pendidikan Tahun Ajaran 2026/2027 Tangsel.';
+    const relevance = verifySourceContentRelevance(
+      textTangsel,
+      'https://disdik.tangerangselatankota.go.id/kaldik',
+      {
+        academicYear: '2026/2027',
+        province: 'Banten',
+        regency: 'Kota Tangerang',
+      },
+      'REGENCY'
+    );
+
+    assert.strictEqual(relevance.isValid, false, 'Tangsel must be rejected when requesting Kota Tangerang');
+  });
+
+  // TEST CC: Kabupaten Tangerang rejected for Kota Tangerang
+  await runTest('CC. Geography guard: Document for Kabupaten Tangerang is rejected for Kota Tangerang', () => {
+    const textKabTangerang = 'Pemerintah Kabupaten Tangerang. Pedoman Kalender Pendidikan Tahun Ajaran 2026/2027 Kabupaten Tangerang.';
+    const relevance = verifySourceContentRelevance(
+      textKabTangerang,
+      'https://disdik.tangerangkab.go.id/kaldik',
+      {
+        academicYear: '2026/2027',
+        province: 'Banten',
+        regency: 'Kota Tangerang',
+      },
+      'REGENCY'
+    );
+
+    assert.strictEqual(relevance.isValid, false, 'Kabupaten Tangerang must be rejected when requesting Kota Tangerang');
+  });
+
+  // TEST CD: NON_OFFICIAL date remains evidence-bound
+  await runTest('CD. Evidence integrity: NON_OFFICIAL dates without textual evidence are discarded', async () => {
+    const sourceText = 'Kalender Pendidikan Tahun Ajaran 2026/2027 Kota Tangerang resmi.';
+
+    const provider = new TrustedCalendarSearchProvider({
+      discoverCandidateUrls: async () => ['https://portal-guru.com/kaldik-tangerang-2026'],
+      fetchSourceContent: async (url) => ({
+        ok: true,
+        status: 200,
+        text: sourceText,
+        finalUrl: url,
+        contentType: 'text/html',
+        isPdf: false,
+      }),
+      generatePlainContent: async () => ({
+        text: JSON.stringify([
+          {
+            province: 'Banten',
+            regency: 'Kota Tangerang',
+            academicYear: '2026/2027',
+            authority: 'Portal Guru',
+            documentTitle: 'Kaldik Tangerang',
+            semester1StartDate: '2026-07-20', // Hallucinated date, not in sourceText
+            semester1EndDate: '2026-12-24',   // Hallucinated date, not in sourceText
+          },
+        ]),
+      }),
+    });
+
+    const res = await provider.searchWithDiagnostics({
+      academicYear: '2026/2027',
+      province: 'Banten',
+      regency: 'Kota Tangerang',
+    });
+
+    assert.strictEqual(res.candidates.length, 1);
+    assert.strictEqual(res.candidates[0].semester1StartDate, undefined, 'Hallucinated start date must be stripped');
+    assert.strictEqual(res.candidates[0].semester1EndDate, undefined, 'Hallucinated end date must be stripped');
+  });
+
+  // TEST CE: NON_OFFICIAL SPMB remains rejected
+  await runTest('CE. Rejection guard: NON_OFFICIAL SPMB/PPDB page without strong calendar evidence is rejected', async () => {
+    const spmbText = 'Penerimaan Murid Baru Online Tahun Ajaran 2026/2027 Kota Tangerang. Informasi SPMB & PPDB.';
+
+    const provider = new TrustedCalendarSearchProvider({
+      discoverCandidateUrls: async () => ['https://ppdb-info.com/tangerang-2026'],
+      fetchSourceContent: async (url) => ({
+        ok: true,
+        status: 200,
+        text: spmbText,
+        finalUrl: url,
+        contentType: 'text/html',
+        isPdf: false,
+      }),
+      generatePlainContent: async () => ({ text: '[]' }),
+    });
+
+    const res = await provider.searchWithDiagnostics({
+      academicYear: '2026/2027',
+      province: 'Banten',
+      regency: 'Kota Tangerang',
+    });
+
+    assert.strictEqual(res.candidates.length, 1);
+    // When rejected, national base candidate is attached
+    assert.strictEqual(res.candidates[0].sourceLevel, 'NATIONAL');
+    assert.strictEqual(res.diagnostic.reason, 'CANDIDATE_REJECTED');
+  });
+
+  // TEST CF: Grounding 429 falls back without failing whole search
+  await runTest('CF. Resilience: Grounding 429 error falls back gracefully to existing discovery and succeeds', async () => {
+    const validDeterministicUrl = 'https://dindik.tangerangkota.go.id/kalender-pendidikan-2026-2027.pdf';
+
+    const provider = new TrustedCalendarSearchProvider({
+      generateGroundedContent: async () => {
+        const error: any = new Error('Resource has been exhausted (e.g. check quota / 429)');
+        error.status = 429;
+        throw error;
+      },
+      fetchSourceContent: async (url) => {
+        if (url === validDeterministicUrl || url.includes('tangerangkota.go.id')) {
+          return {
+            ok: true,
+            status: 200,
+            text: 'Keputusan Kepala Dinas Pendidikan Kota Tangerang tentang Kalender Pendidikan Tahun Ajaran 2026/2027 Kota Tangerang resmi.',
+            finalUrl: url,
+            contentType: 'application/pdf',
+            isPdf: true,
+          };
+        }
+        return null;
+      },
+      generatePlainContent: async () => ({
+        text: JSON.stringify([
+          {
+            province: 'Banten',
+            regency: 'Kota Tangerang',
+            academicYear: '2026/2027',
+            authority: 'Dinas Pendidikan Kota Tangerang',
+            documentTitle: 'Kaldik 2026/2027',
+          },
+        ]),
+      }),
+    });
+
+    const res = await provider.searchWithDiagnostics({
+      academicYear: '2026/2027',
+      province: 'Banten',
+      regency: 'Kota Tangerang',
+    });
+
+    assert.strictEqual(res.diagnostic.reason, 'SUCCESS');
+    assert.strictEqual(res.candidates.length, 1);
+    assert.strictEqual(res.candidates[0].sourceLevel, 'REGENCY');
+    assert.strictEqual(res.candidates[0].authorityType, 'OFFICIAL');
+  });
+
+  // TEST CG: REGENCY empty + PROVINCE valid returns PROVINCE
+  await runTest('CG. Hierarchy fallback: REGENCY empty falls back to PROVINCE and returns PROVINCE candidate', async () => {
+    const provUrl = 'https://dindikbud.bantenprov.go.id/kaldik-2026-2027';
+
+    const provider = new TrustedCalendarSearchProvider({
+      discoverCandidateUrls: async (_req, level) => {
+        if (level === 'PROVINCE') return [provUrl];
+        return [];
+      },
+      fetchSourceContent: async (url) => ({
+        ok: true,
+        status: 200,
+        text: 'Keputusan Kepala Dinas Pendidikan Kalender Pendidikan Tahun Ajaran 2026/2027 Provinsi Banten',
+        finalUrl: url,
+        contentType: 'text/html',
+        isPdf: false,
+      }),
+      generatePlainContent: async () => ({
+        text: JSON.stringify([
+          {
+            province: 'Banten',
+            academicYear: '2026/2027',
+            authority: 'Dindikbud Provinsi Banten',
+            documentTitle: 'Kaldik Provinsi Banten 2026/2027',
+          },
+        ]),
+      }),
+    });
+
+    const res = await provider.searchWithDiagnostics({
+      academicYear: '2026/2027',
+      province: 'Banten',
+      regency: 'Kota Tangerang',
+    });
+
+    assert.strictEqual(res.diagnostic.reason, 'SUCCESS');
+    assert.strictEqual(res.candidates.length, 1);
+    assert.strictEqual(res.candidates[0].sourceLevel, 'PROVINCE');
+    assert.strictEqual(res.candidates[0].sourceUrl, provUrl);
+  });
+
+  // TEST CH: REGENCY + PROVINCE empty returns NATIONAL_BASE
+  await runTest('CH. National Base fallback: When REGENCY and PROVINCE are empty, returns NATIONAL_BASE candidate', async () => {
+    const provider = new TrustedCalendarSearchProvider({
+      discoverCandidateUrls: async () => [],
+      fetchSourceContent: async () => null,
+      generatePlainContent: async () => ({ text: '[]' }),
+    });
+
+    const res = await provider.searchWithDiagnostics({
+      academicYear: '2026/2027',
+      province: 'Papua Pegunungan',
+      regency: 'Kabupaten Nduga',
+    });
+
+    assert.strictEqual(res.candidates.length, 1);
+    assert.strictEqual(res.candidates[0].sourceLevel, 'NATIONAL');
+    assert.strictEqual(res.candidates[0].authorityType, 'OFFICIAL');
+    assert.strictEqual(res.candidates[0].confidence, 'HIGH');
+  });
+
+  // TEST CI: NATIONAL_BASE contains verified national events and is PARTIALLY_RESOLVED
+  await runTest('CI. National Base content: Verified national holidays & cuti bersama included with PARTIAL status', () => {
+    const nationalBase = buildNationalBaseCandidate('2026/2027');
+
+    assert.strictEqual(nationalBase.sourceLevel, 'NATIONAL');
+    assert.strictEqual(nationalBase.authorityType, 'OFFICIAL');
+    assert.strictEqual(nationalBase.confidence, 'HIGH');
+    assert.strictEqual(nationalBase.verificationStatus, 'PARTIAL');
+    assert.ok(Array.isArray(nationalBase.events) && nationalBase.events.length > 0);
+    assert.ok(nationalBase.events.some((e) => e.name.toLowerCase().includes('kemerdekaan') || e.name.toLowerCase().includes('tahun baru') || e.name.toLowerCase().includes('idul fitri')));
+    assert.strictEqual(nationalBase.semester1StartDate, undefined, 'Must not fabricate semester boundaries');
+    assert.strictEqual(nationalBase.semester1EndDate, undefined, 'Must not fabricate semester boundaries');
+  });
+
+  // TEST CJ: NATIONAL candidate is recognized as usable by UI
+  await runTest('CJ. UI Usability: NATIONAL candidate is recognized as usable and evaluates to PARTIALLY_RESOLVED', () => {
+    const nationalBase = buildNationalBaseCandidate('2026/2027');
+
+    assert.strictEqual(isUsableCalendarCandidate(nationalBase), true, 'NATIONAL candidate must be usable');
+    const status = evaluateCalendarCandidate(nationalBase);
+    assert.strictEqual(status, 'PARTIALLY_RESOLVED', 'NATIONAL candidate must evaluate to PARTIALLY_RESOLVED');
+  });
+
+  // TEST CK: Search failure never results in completely empty initial calendar data
+  await runTest('CK. Never empty guarantee: Complete search failure still provides verified initial National Base data', async () => {
+    const provider = new TrustedCalendarSearchProvider({
+      discoverCandidateUrls: async () => {
+        throw new Error('Network offline / search failure');
+      },
+      fetchSourceContent: async () => null,
+      generatePlainContent: async () => {
+        throw new Error('AI service unreachable');
+      },
+    });
+
+    const candidates = await provider.search({
+      academicYear: '2026/2027',
+      province: 'Maluku Utara',
+      regency: 'Kabupaten Halmahera Barat',
+    });
+
+    assert.ok(Array.isArray(candidates));
+    assert.ok(candidates.length >= 1, 'Search must never return empty array');
+    assert.strictEqual(candidates[0].sourceLevel, 'NATIONAL');
+    assert.ok(candidates[0].events && candidates[0].events.length > 0, 'Must have national events');
+  });
+
+  // TEST CL: Grounding returns valid NON_OFFICIAL + deterministic pass contains valid OFFICIAL -> OFFICIAL must win
+  await runTest('CL. Same-stage priority: When Grounding returns valid NON_OFFICIAL and deterministic has valid OFFICIAL, OFFICIAL must win', async () => {
+    const nonOfficialUrl = 'https://beritapendidikan.com/kaldik-kota-tangerang-2026-2027';
+    const officialDeterministicUrl = 'https://dindik.tangerangkota.go.id/kalender-pendidikan-2026-2027.pdf';
+
+    const provider = new TrustedCalendarSearchProvider({
+      generateGroundedContent: async () => ({
+        text: 'Sumber kalender tangerang nonresmi',
+        candidates: [
+          {
+            groundingMetadata: {
+              groundingChunks: [
+                {
+                  web: {
+                    uri: nonOfficialUrl,
+                    title: 'Berita Pendidikan Kaldik Tangerang',
+                  },
+                },
+              ],
+            },
+          },
+        ],
+      }),
+      fetchSourceContent: async (url) => {
+        if (url === nonOfficialUrl) {
+          return {
+            ok: true,
+            status: 200,
+            text: 'Pedoman Kalender Pendidikan Tahun Ajaran 2026/2027 Kota Tangerang lengkap.',
+            finalUrl: url,
+            contentType: 'text/html',
+            isPdf: false,
+          };
+        }
+        if (url === officialDeterministicUrl || url.includes('tangerangkota.go.id')) {
+          return {
+            ok: true,
+            status: 200,
+            text: 'Keputusan Kepala Dinas Pendidikan Kota Tangerang tentang Pedoman Kalender Pendidikan Tahun Ajaran 2026/2027 Kota Tangerang resmi.',
+            finalUrl: url,
+            contentType: 'application/pdf',
+            isPdf: true,
+          };
+        }
+        return null;
+      },
+      generatePlainContent: async (_prompt) => ({
+        text: JSON.stringify([
+          {
+            province: 'Banten',
+            regency: 'Kota Tangerang',
+            academicYear: '2026/2027',
+            authority: 'Dinas Pendidikan Kota Tangerang',
+            documentTitle: 'Kaldik Kota Tangerang 2026/2027',
+          },
+        ]),
+      }),
+    });
+
+    const res = await provider.searchWithDiagnostics({
+      academicYear: '2026/2027',
+      province: 'Banten',
+      regency: 'Kota Tangerang',
+    });
+
+    assert.strictEqual(res.diagnostic.reason, 'SUCCESS');
+    assert.ok(res.candidates.length >= 1);
+    assert.strictEqual(res.candidates[0].authorityType, 'OFFICIAL', 'OFFICIAL candidate must win over NON_OFFICIAL');
+    assert.strictEqual(res.candidates[0].sourceLevel, 'REGENCY');
+    assert.strictEqual(isOfficialCalendarSourceUrl(res.candidates[0].sourceUrl), true);
+  });
+
+  // TEST CM: National Base manual boundary projection produces CalendarDay national events upon confirmation
+  await runTest('CM. National Base confirmation: When teacher supplies manual semester boundaries, national events are projected into CalendarDay[]', () => {
+    const nationalBase = buildNationalBaseCandidate('2026/2027');
+    assert.strictEqual(nationalBase.sourceLevel, 'NATIONAL');
+    assert.strictEqual(nationalBase.semester1StartDate, undefined);
+    assert.strictEqual(nationalBase.semester1EndDate, undefined);
+
+    const manualStartDate = '2026-07-13';
+    const manualEndDate = '2026-12-18';
+
+    const candidateToProject = nationalBase.sourceLevel === 'NATIONAL'
+      ? { ...nationalBase, events: undefined }
+      : nationalBase;
+
+    const projectedDays = projectCandidateEventsToCalendarDays({
+      candidate: candidateToProject,
+      startDate: manualStartDate,
+      endDate: manualEndDate,
+      calendarId: 'cal-test-national',
+      existingDays: [],
+      academicYear: '2026/2027',
+    });
+
+    assert.ok(projectedDays.length > 0, 'Projected days must not be empty');
+
+    // Confirm workflow
+    const currentCal = {
+      id: 'cal-test-national',
+      academicSettingId: 'as-100',
+      academicYear: '2026/2027',
+      semester: '1 (Ganjil)',
+      startDate: manualStartDate,
+      endDate: manualEndDate,
+      schoolDaysPerWeek: 5,
+      sourceType: 'REGIONAL_EDUCATION_CALENDAR' as const,
+      workflowStatus: 'CONFIRMED' as const,
+      jpPerWeek: 4,
+      updatedAt: new Date().toISOString(),
+    };
+
+    const confirmRes = confirmCalendarWorkflow(currentCal, projectedDays);
+    assert.strictEqual(confirmRes.calendar.workflowStatus, 'CONFIRMED');
+    assert.ok(confirmRes.days.length > 0, 'Confirmed calendar must retain national days');
+
+    // Verify 17 Agustus 2026 is present in confirmed days
+    const agustus17 = confirmRes.days.find((d) => d.date === '2026-08-17');
+    assert.ok(agustus17, '17 Agustus 2026 must be present in projected CalendarDay records');
+    assert.strictEqual(agustus17.status, 'holiday');
+  });
+
+  // TEST CN: Provenance integrity: 2026 events use 2026 source, 2027 events use 2027 source
+  await runTest('CN. Provenance integrity: 2026 events attribute to 2026 SKB, 2027 events attribute to 2027 SKB', () => {
+    const nationalBase = buildNationalBaseCandidate('2026/2027');
+
+    const candidateToProject = nationalBase.sourceLevel === 'NATIONAL'
+      ? { ...nationalBase, events: undefined }
+      : nationalBase;
+
+    // Project Semester 1 (2026)
+    const sem1Days = projectCandidateEventsToCalendarDays({
+      candidate: candidateToProject,
+      startDate: '2026-07-01',
+      endDate: '2026-12-31',
+      calendarId: 'cal-sem1',
+      existingDays: [],
+      academicYear: '2026/2027',
+    });
+
+    // Project Semester 2 (2027)
+    const sem2Days = projectCandidateEventsToCalendarDays({
+      candidate: candidateToProject,
+      startDate: '2027-01-01',
+      endDate: '2027-06-30',
+      calendarId: 'cal-sem2',
+      existingDays: [],
+      academicYear: '2026/2027',
+    });
+
+    const day2026 = sem1Days.find((d) => d.date === '2026-08-17');
+    assert.ok(day2026, '2026-08-17 must exist in Semester 1');
+    assert.ok(
+      day2026.sourceProvenances && day2026.sourceProvenances.length > 0,
+      '2026 event must have sourceProvenances'
+    );
+    const prov2026 = day2026.sourceProvenances[0];
+    assert.ok(
+      prov2026.documentTitle.includes('2026') || prov2026.documentNumber?.includes('2025') || prov2026.sourceUrl?.includes('2026'),
+      '2026 event must reference 2026 holiday source'
+    );
+    assert.ok(
+      !prov2026.documentTitle.includes('Tahun 2027'),
+      '2026 event MUST NOT be attributed to 2027 source'
+    );
+
+    const day2027 = sem2Days.find((d) => d.date === '2027-05-01');
+    assert.ok(day2027, '2027-05-01 must exist in Semester 2');
+    assert.ok(
+      day2027.sourceProvenances && day2027.sourceProvenances.length > 0,
+      '2027 event must have sourceProvenances'
+    );
+    const prov2027 = day2027.sourceProvenances[0];
+    assert.ok(
+      prov2027.documentTitle.includes('2027') || prov2027.documentNumber?.includes('2026') || prov2027.sourceUrl?.includes('2027'),
+      '2027 event must reference 2027 holiday source'
+    );
+    assert.ok(
+      !prov2027.documentTitle.includes('Tahun 2026'),
+      '2027 event MUST NOT be attributed to 2026 source'
+    );
+  });
+
+  // =========================================================================
+  // TEST CO: Correct 2026 Official Dataset (SKB 3 Menteri)
+  // =========================================================================
+  await runTest('CO. Official SSOT 2026 dataset matches SKB 3 Menteri accurately', () => {
+    const cutiFeb16 = OFFICIAL_NATIONAL_HOLIDAYS.find((h) => h.date === '2026-02-16');
+    assert.ok(cutiFeb16 && cutiFeb16.type === 'CUTI_BERSAMA', '2026-02-16 must exist as CUTI_BERSAMA');
+
+    const cutiFeb18 = OFFICIAL_NATIONAL_HOLIDAYS.find((h) => h.date === '2026-02-18');
+    assert.strictEqual(cutiFeb18, undefined, '2026-02-18 CUTI_BERSAMA must NOT exist');
+
+    const idul1 = OFFICIAL_NATIONAL_HOLIDAYS.find((h) => h.date === '2026-03-21');
+    assert.ok(idul1 && idul1.type === 'NATIONAL_HOLIDAY', '2026-03-21 Idulfitri Hari 1 must exist');
+
+    const idul2 = OFFICIAL_NATIONAL_HOLIDAYS.find((h) => h.date === '2026-03-22');
+    assert.ok(idul2 && idul2.type === 'NATIONAL_HOLIDAY', '2026-03-22 Idulfitri Hari 2 must exist');
+
+    const paskah = OFFICIAL_NATIONAL_HOLIDAYS.find((h) => h.date === '2026-04-05');
+    assert.ok(paskah && paskah.type === 'NATIONAL_HOLIDAY', '2026-04-05 Paskah must exist');
+
+    const cutiDec24 = OFFICIAL_NATIONAL_HOLIDAYS.find((h) => h.date === '2026-12-24');
+    assert.ok(cutiDec24 && cutiDec24.type === 'CUTI_BERSAMA', '2026-12-24 Cuti Natal must exist');
+
+    const cutiDec26 = OFFICIAL_NATIONAL_HOLIDAYS.find((h) => h.date === '2026-12-26');
+    assert.strictEqual(cutiDec26, undefined, '2026-12-26 CUTI_BERSAMA must NOT exist');
+  });
+
+  // =========================================================================
+  // TEST CP: Correct 2027 Official Dataset (SKB 3 Menteri)
+  // =========================================================================
+  await runTest('CP. Official SSOT 2027 dataset matches SKB 3 Menteri accurately', () => {
+    const nyepi = OFFICIAL_NATIONAL_HOLIDAYS.find((h) => h.date === '2027-03-08');
+    assert.ok(nyepi && nyepi.type === 'NATIONAL_HOLIDAY', '2027-03-08 Nyepi must exist');
+
+    const cutiMar9 = OFFICIAL_NATIONAL_HOLIDAYS.find((h) => h.date === '2027-03-09');
+    assert.ok(cutiMar9 && cutiMar9.type === 'CUTI_BERSAMA', '2027-03-09 Cuti Idulfitri must exist');
+
+    const idul1 = OFFICIAL_NATIONAL_HOLIDAYS.find((h) => h.date === '2027-03-10');
+    assert.ok(idul1 && idul1.type === 'NATIONAL_HOLIDAY', '2027-03-10 Idulfitri Hari 1 must exist');
+
+    const idul2 = OFFICIAL_NATIONAL_HOLIDAYS.find((h) => h.date === '2027-03-11');
+    assert.ok(idul2 && idul2.type === 'NATIONAL_HOLIDAY', '2027-03-11 Idulfitri Hari 2 must exist');
+
+    const paskah = OFFICIAL_NATIONAL_HOLIDAYS.find((h) => h.date === '2027-03-28');
+    assert.ok(paskah && paskah.type === 'NATIONAL_HOLIDAY', '2027-03-28 Paskah must exist');
+
+    const cutiDec24 = OFFICIAL_NATIONAL_HOLIDAYS.find((h) => h.date === '2027-12-24');
+    assert.ok(cutiDec24 && cutiDec24.type === 'CUTI_BERSAMA', '2027-12-24 Cuti Natal must exist');
+
+    const natal = OFFICIAL_NATIONAL_HOLIDAYS.find((h) => h.date === '2027-12-25');
+    assert.ok(natal && natal.type === 'NATIONAL_HOLIDAY', '2027-12-25 Natal must exist');
+
+    const isra = OFFICIAL_NATIONAL_HOLIDAYS.find((h) => h.date === '2027-12-26');
+    assert.ok(isra && isra.type === 'NATIONAL_HOLIDAY', '2027-12-26 Isra Mikraj must exist');
+  });
+
+  // =========================================================================
+  // TEST CQ: Academic Year Range 2026/2027 (2026-07-01 to 2027-06-30)
+  // =========================================================================
+  await runTest('CQ. buildNationalBaseCandidate for 2026/2027 strictly spans 2026-07-01 to 2027-06-30', () => {
+    const candidate = buildNationalBaseCandidate('2026/2027');
+    assert.ok(candidate.events && candidate.events.length > 0, 'Candidate events must exist');
+
+    for (const ev of candidate.events) {
+      assert.ok(ev.startDate >= '2026-07-01', `Event date ${ev.startDate} must be >= 2026-07-01`);
+      assert.ok(ev.startDate <= '2027-06-30', `Event date ${ev.startDate} must be <= 2027-06-30`);
+    }
+
+    const aug2027 = candidate.events.find((e) => e.startDate === '2027-08-17');
+    assert.strictEqual(aug2027, undefined, '2027-08-17 must NOT be in 2026/2027 academic year candidate');
+  });
+
+  // =========================================================================
+  // TEST CR: Semester 1 National Draft Projection
+  // =========================================================================
+  await runTest('CR. Semester 1 National draft projection produces CalendarDay[] for July-Dec without boundary fabrication', () => {
+    const cand = buildNationalBaseCandidate('2026/2027');
+    const days = projectNationalBaseToSemesterDraft({
+      candidate: cand,
+      academicYear: '2026/2027',
+      semester: '1',
+      calendarId: 'cal-sem1',
+    });
+
+    assert.ok(days.length > 0, 'Semester 1 days must not be empty');
+    assert.ok(days.some((d) => d.date === '2026-08-17'), '2026-08-17 Proklamasi must exist');
+    assert.ok(days.some((d) => d.date === '2026-08-25'), '2026-08-25 Maulid Nabi must exist');
+    assert.ok(days.some((d) => d.date === '2026-12-24' || d.date === '2026-12-25'), 'December Natal events must exist');
+
+    for (const d of days) {
+      assert.ok(d.date >= '2026-07-01' && d.date <= '2026-12-31', `Day ${d.date} must fall in Semester 1 window`);
+    }
+  });
+
+  // =========================================================================
+  // TEST CS: Semester 2 National Draft Projection
+  // =========================================================================
+  await runTest('CS. Semester 2 National draft projection produces CalendarDay[] for Jan-June 2027', () => {
+    const cand = buildNationalBaseCandidate('2026/2027');
+    const days = projectNationalBaseToSemesterDraft({
+      candidate: cand,
+      academicYear: '2026/2027',
+      semester: '2',
+      calendarId: 'cal-sem2',
+    });
+
+    assert.ok(days.length > 0, 'Semester 2 days must not be empty');
+    assert.ok(days.some((d) => d.date === '2027-01-01'), '2027-01-01 Tahun Baru must exist');
+    assert.ok(days.some((d) => d.date === '2027-01-05'), '2027-01-05 Isra Mikraj must exist');
+    assert.ok(days.some((d) => d.date === '2027-02-05' || d.date === '2027-02-06'), 'February Imlek events must exist');
+    assert.ok(days.some((d) => d.date >= '2027-03-08' && d.date <= '2027-03-15'), 'March Nyepi/Idulfitri events must exist');
+    assert.ok(!days.some((d) => d.date === '2027-08-17'), '2027-08-17 must NOT be in Semester 2 of 2026/2027');
+
+    for (const d of days) {
+      assert.ok(d.date >= '2027-01-01' && d.date <= '2027-06-30', `Day ${d.date} must fall in Semester 2 window`);
+    }
+  });
+
+  // =========================================================================
+  // TEST CT: Backend/Network Total Failure Still Produces National Base
+  // =========================================================================
+  await runTest('CT. Backend or network total failure produces National Base with non-empty days', async () => {
+    const provider = new GroundedCalendarSearchProvider({
+      generateGroundedContent: async () => {
+        throw new Error('503 Service Unavailable');
+      },
+    });
+
+    const req: CalendarSearchRequest = {
+      academicYear: '2026/2027',
+      province: 'Papua',
+      regency: 'Kabupaten Jayapura',
+    };
+
+    let candidates: CalendarSourceCandidate[] = [];
+    try {
+      candidates = await provider.search(req);
+    } catch {
+      candidates = [buildNationalBaseCandidate(req.academicYear)];
+    }
+
+    if (candidates.length === 0) {
+      candidates = [buildNationalBaseCandidate(req.academicYear)];
+    }
+
+    const selected = selectBestCalendarSource(candidates, req);
+    assert.ok(selected !== null, 'selected source must not be null');
+    assert.strictEqual(selected.sourceLevel, 'NATIONAL');
+
+    const draftDays = projectNationalBaseToSemesterDraft({
+      candidate: selected,
+      academicYear: req.academicYear,
+      semester: '1',
+    });
+    assert.ok(draftDays.length > 0, 'Draft days must not be empty on total provider failure');
+  });
+
+  // =========================================================================
+  // TEST CU: Manual Precedence over National Base
+  // =========================================================================
+  await runTest('CU. Manual SCHOOL_OVERRIDE on a national holiday date is preserved during National Base projection', () => {
+    const manualDay = {
+      id: 'manual-aug-17',
+      academicCalendarId: 'cal-sem1',
+      date: '2026-08-17',
+      status: 'SCHOOL_EVENT' as const,
+      notes: 'Upacara Mandiri Sekolah',
+      sourceType: 'SCHOOL_OVERRIDE' as const,
+      sourceLayer: 'SCHOOL_OVERRIDE' as const,
+      isOverridden: true,
+      category: 'SCHOOL_EVENT' as const,
+    };
+
+    const days = projectNationalBaseToSemesterDraft({
+      academicYear: '2026/2027',
+      semester: '1',
+      existingDays: [manualDay],
+    });
+
+    const targetDay = days.find((d) => d.date === '2026-08-17');
+    assert.ok(targetDay, 'Day on 2026-08-17 must exist');
+    assert.strictEqual(targetDay.sourceType, 'SCHOOL_OVERRIDE', 'SCHOOL_OVERRIDE must win over national base overlay');
+    assert.strictEqual(targetDay.notes, 'Upacara Mandiri Sekolah');
+  });
+
+  // =========================================================================
+  // TEST CW: Planning Baseline Semester 1 (2026/2027)
+  // =========================================================================
+  await runTest('CW. Planning Baseline for 2026/2027 Semester 1 returns 2026-07-13 to 2026-12-18 and 5 days/week', () => {
+    const base = resolvePlanningBaseline({ academicYear: '2026/2027', semester: '1' });
+    assert.strictEqual(base.startDate, '2026-07-13');
+    assert.strictEqual(base.endDate, '2026-12-18');
+    assert.strictEqual(base.schoolDaysPerWeek, 5);
+  });
+
+  // =========================================================================
+  // TEST CX: Planning Baseline Semester 2 (2026/2027)
+  // =========================================================================
+  await runTest('CX. Planning Baseline for 2026/2027 Semester 2 returns 2027-01-04 to 2027-06-18 and 5 days/week', () => {
+    const base = resolvePlanningBaseline({ academicYear: '2026/2027', semester: '2' });
+    assert.strictEqual(base.startDate, '2027-01-04');
+    assert.strictEqual(base.endDate, '2027-06-18');
+    assert.strictEqual(base.schoolDaysPerWeek, 5);
+  });
+
+  // =========================================================================
+  // TEST CY: Generate Weekdays for 5-day mode
+  // =========================================================================
+  await runTest('CY. generateEffectiveCalendarDays in 5-day mode generates Mon-Fri as effective, excluding Sat and Sun', () => {
+    const base = resolvePlanningBaseline({ academicYear: '2026/2027', semester: '1' });
+    const days = generateEffectiveCalendarDays({
+      startDate: base.startDate,
+      endDate: base.endDate,
+      schoolDaysPerWeek: 5,
+      calendarId: 'cal-cw',
+      academicYear: '2026/2027',
+    });
+
+    assert.ok(days.length > 20, 'Generated days should contain full semester weekdays');
+
+    // Check ordinary Monday (2026-07-20)
+    const mon = days.find((d) => d.date === '2026-07-20');
+    assert.ok(mon, '2026-07-20 (Monday) must exist');
+    assert.strictEqual(mon.status, 'effective');
+    assert.strictEqual(mon.sourceLayer, 'GENERATED_EFFECTIVE_BASELINE');
+
+    // Saturday 2026-07-25 must not exist
+    const sat = days.find((d) => d.date === '2026-07-25');
+    assert.strictEqual(sat, undefined, 'Saturday must NOT be generated in 5-day mode');
+
+    // Sunday 2026-07-26 must not exist
+    const sun = days.find((d) => d.date === '2026-07-26');
+    assert.strictEqual(sun, undefined, 'Sunday must NOT be generated');
+  });
+
+  // =========================================================================
+  // TEST CZ: Generate Weekdays for 6-day mode
+  // =========================================================================
+  await runTest('CZ. generateEffectiveCalendarDays in 6-day mode generates Mon-Sat as effective, excluding Sun', () => {
+    const base = resolvePlanningBaseline({ academicYear: '2026/2027', semester: '1' });
+    const days = generateEffectiveCalendarDays({
+      startDate: base.startDate,
+      endDate: base.endDate,
+      schoolDaysPerWeek: 6,
+      calendarId: 'cal-cz',
+      academicYear: '2026/2027',
+    });
+
+    const sat = days.find((d) => d.date === '2026-07-25');
+    assert.ok(sat, 'Saturday 2026-07-25 MUST exist in 6-day mode');
+    assert.strictEqual(sat.status, 'effective');
+
+    const sun = days.find((d) => d.date === '2026-07-26');
+    assert.strictEqual(sun, undefined, 'Sunday 2026-07-26 must NOT exist in 6-day mode');
+  });
+
+  // =========================================================================
+  // TEST DA: National Overlay Wins over Effective Baseline
+  // =========================================================================
+  await runTest('DA. National holiday (2026-08-17) overlays generated weekday and changes status to holiday', () => {
+    const base = resolvePlanningBaseline({ academicYear: '2026/2027', semester: '1' });
+    const days = generateEffectiveCalendarDays({
+      startDate: base.startDate,
+      endDate: base.endDate,
+      schoolDaysPerWeek: 5,
+      calendarId: 'cal-da',
+      academicYear: '2026/2027',
+    });
+
+    const aug17 = days.find((d) => d.date === '2026-08-17');
+    assert.ok(aug17, '2026-08-17 must exist');
+    assert.strictEqual(aug17.status, 'holiday', '2026-08-17 must be holiday');
+    assert.strictEqual(aug17.sourceLayer, 'NATIONAL_OVERLAY');
+  });
+
+  // =========================================================================
+  // TEST DB: Cuti Bersama Wins over Effective Baseline
+  // =========================================================================
+  await runTest('DB. Cuti bersama (2026-12-24) overlays generated weekday and sets category CUTI_BERSAMA', () => {
+    const base = resolvePlanningBaseline({ academicYear: '2026/2027', semester: '1' });
+    const days = generateEffectiveCalendarDays({
+      startDate: base.startDate,
+      endDate: '2026-12-31',
+      schoolDaysPerWeek: 5,
+      calendarId: 'cal-db',
+      academicYear: '2026/2027',
+    });
+
+    const dec24 = days.find((d) => d.date === '2026-12-24');
+    assert.ok(dec24, '2026-12-24 must exist');
+    assert.strictEqual(dec24.status, 'BREAK', 'Cuti bersama status must be BREAK');
+    assert.strictEqual(dec24.category, 'CUTI_BERSAMA', 'Cuti bersama category must be CUTI_BERSAMA');
+  });
+
+  // =========================================================================
+  // TEST DC: Manual SCHOOL_OVERRIDE Priority over Generated Baseline
+  // =========================================================================
+  await runTest('DC. Existing SCHOOL_OVERRIDE day survives calendar regeneration', () => {
+    const manualDay = {
+      id: 'manual-aug-17',
+      academicCalendarId: 'cal-dc',
+      date: '2026-08-17',
+      status: 'SCHOOL_EVENT' as const,
+      notes: 'Lomba Sekolah',
+      sourceType: 'SCHOOL_OVERRIDE' as const,
+      sourceLayer: 'SCHOOL_OVERRIDE' as const,
+      isOverridden: true,
+      category: 'SCHOOL_EVENT' as const,
+    };
+
+    const days = generateEffectiveCalendarDays({
+      startDate: '2026-07-13',
+      endDate: '2026-12-18',
+      schoolDaysPerWeek: 5,
+      calendarId: 'cal-dc',
+      academicYear: '2026/2027',
+      existingDays: [manualDay],
+    });
+
+    const aug17 = days.find((d) => d.date === '2026-08-17');
+    assert.ok(aug17, '2026-08-17 must exist');
+    assert.strictEqual(aug17.sourceType, 'SCHOOL_OVERRIDE');
+    assert.strictEqual(aug17.notes, 'Lomba Sekolah');
+  });
+
+  // =========================================================================
+  // TEST DD: Effective Day & Week Calculations
+  // =========================================================================
+  await runTest('DD. Generated Semester 1 baseline produces positive HE and ME with zero unknownDays', () => {
+    const base = resolvePlanningBaseline({ academicYear: '2026/2027', semester: '1' });
+    const days = generateEffectiveCalendarDays({
+      startDate: base.startDate,
+      endDate: base.endDate,
+      schoolDaysPerWeek: 5,
+      calendarId: 'cal-dd',
+      academicYear: '2026/2027',
+    });
+
+    const effRes = calculateEffectiveDays({ startDate: base.startDate, endDate: base.endDate, schoolDaysPerWeek: 5 }, days);
+    assert.ok(effRes.effectiveLearningDays > 0, 'effectiveLearningDays must be > 0');
+    assert.ok(effRes.holidayDays > 0, 'holidayDays must be > 0');
+
+    const weekRes = calculateEffectiveWeeks(effRes.effectiveLearningDays, 5);
+    assert.ok(weekRes.effectiveWeeksRounded > 0, 'effectiveWeeksRounded must be > 0');
+  });
+
+  // =========================================================================
+  // TEST DG: Unknown Academic Year Must Not Reuse 2026/2027
+  // =========================================================================
+  await runTest('DG. Unknown academic year must not reuse 2026/2027 baseline dates', () => {
+    const base = resolvePlanningBaseline({ academicYear: '2027/2028', semester: '1' });
+    assert.strictEqual(base.isBaselineAvailable, false);
+    assert.strictEqual(base.startDate, '');
+    assert.strictEqual(base.endDate, '');
+  });
+
+  // =========================================================================
+  // TEST DH: NATIONAL Provenance Is Kept as National Overlay
+  // =========================================================================
+  await runTest('DH. NATIONAL candidate events are mapped exclusively as NATIONAL_OVERLAY and never REGIONAL_BASE', () => {
+    const natCandidate = buildNationalBaseCandidate('2026/2027');
+    const days = generateEffectiveCalendarDays({
+      startDate: '2026-07-13',
+      endDate: '2026-12-18',
+      schoolDaysPerWeek: 5,
+      calendarId: 'cal-dh',
+      academicYear: '2026/2027',
+      candidate: natCandidate,
+    });
+
+    const aug17 = days.find((d) => d.date === '2026-08-17');
+    assert.ok(aug17, 'Independence day 2026-08-17 must exist');
+    assert.strictEqual(aug17.sourceLayer, 'NATIONAL_OVERLAY');
+    assert.strictEqual(aug17.sourceType, 'NATIONAL_HOLIDAY_OVERLAY');
+    assert.strictEqual(aug17.category, 'NATIONAL_HOLIDAY');
+    assert.strictEqual(aug17.status, 'holiday');
+
+    // No REGIONAL_BASE should exist
+    const hasRegionalBase = days.some((d) => d.sourceLayer === 'REGIONAL_BASE');
+    assert.strictEqual(hasRegionalBase, false, 'Should not have any regional base layer events for national candidate');
+  });
+
+  console.log(`\n========================================`);
+  console.log(`ALL BACKEND CALENDAR SEARCH PROVIDER TESTS PASSED (${passedTests}/${totalTests})`);
+  console.log(`========================================\n`);
+}
+
+main().catch((err) => {
+  console.error('Fatal error in testCalendarBackendSearchProvider:', err);
+  process.exit(1);
+});

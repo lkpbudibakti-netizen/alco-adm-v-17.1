@@ -1,0 +1,1725 @@
+import { GoogleGenAI } from '@google/genai';
+import * as pdfjsLib from 'pdfjs-dist/legacy/build/pdf.mjs';
+import {
+  CalendarDataProvider,
+  CalendarSearchRequest,
+  CalendarSourceCandidate,
+  CalendarSourceLevel,
+  CalendarSourceEvent,
+  type CalendarSourceAuthorityType,
+  CalendarSearchDiagnostic,
+  CalendarSearchDiagnosticReason,
+  CalendarStageDiagnostic,
+  CalendarModelAttemptDiagnostic,
+  CalendarSearchResultWithDiagnostics,
+  normalizeRegionName,
+  classifyCalendarSourceAuthority,
+  isSafeCalendarSourceUrl,
+  buildNationalBaseCandidate,
+} from '../src/services/calendarProvider';
+import {
+  isOfficialCalendarSourceUrl,
+  sanitizeErrorCategory,
+  classifyProviderError,
+  GroundedGenerateFn,
+  extractGroundedWebSources,
+} from './calendarProvider';
+
+/**
+ * Validates date string in strict YYYY-MM-DD format.
+ */
+export function sanitizeIsoDate(dateStr?: unknown): string | undefined {
+  if (typeof dateStr !== 'string') return undefined;
+  const trimmed = dateStr.trim();
+  if (/^\d{4}-\d{2}-\d{2}$/.test(trimmed)) {
+    const d = new Date(trimmed);
+    if (!isNaN(d.getTime())) {
+      return trimmed;
+    }
+  }
+  return undefined;
+}
+
+const INDONESIAN_MONTHS: Record<number, string[]> = {
+  1: ['januari', 'jan'],
+  2: ['februari', 'feb'],
+  3: ['maret', 'mar'],
+  4: ['april', 'apr'],
+  5: ['mei'],
+  6: ['juni', 'jun'],
+  7: ['juli', 'jul'],
+  8: ['agustus', 'agt', 'agu'],
+  9: ['september', 'sep'],
+  10: ['oktober', 'okt'],
+  11: ['november', 'nov'],
+  12: ['desember', 'des'],
+};
+
+/**
+ * Pure deterministic evidence checker.
+ * Returns true only if the given ISO date (YYYY-MM-DD) is explicitly supported
+ * by the supplied source text in standard Indonesian or numeric formats.
+ */
+export function isDateSupportedBySource(
+  isoDate: string,
+  sourceText: string
+): boolean {
+  if (!isoDate || !sourceText || typeof isoDate !== 'string' || typeof sourceText !== 'string') {
+    return false;
+  }
+
+  const match = isoDate.trim().match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (!match) return false;
+
+  const [_, yearStr, monthStr, dayStr] = match;
+  const monthNum = parseInt(monthStr, 10);
+  const dayNum = parseInt(dayStr, 10);
+  if (monthNum < 1 || monthNum > 12 || dayNum < 1 || dayNum > 31) return false;
+
+  const dayPadded = dayStr;
+  const dayUnpadded = String(dayNum);
+  const monthPadded = monthStr;
+  const monthUnpadded = String(monthNum);
+
+  const text = sourceText.toLowerCase();
+
+  // 1. ISO format: 2026-07-13, 2026/07/13, 2026.07.13
+  const isoPattern = new RegExp(`\\b${yearStr}[-/\\.]${monthPadded}[-/\\.]${dayPadded}\\b`, 'i');
+  if (isoPattern.test(text)) return true;
+
+  // 2. Numeric DD-MM-YYYY or D-M-YYYY: 13-07-2026, 13/07/2026, 13.07.2026, 13-7-2026, etc.
+  const dmyNumericPattern = new RegExp(`\\b(?:${dayPadded}|${dayUnpadded})[-/\\.](?:${monthPadded}|${monthUnpadded})[-/\\.]${yearStr}\\b`, 'i');
+  if (dmyNumericPattern.test(text)) return true;
+
+  // 3. Indonesian textual month names: 13 Juli 2026, 13-juli-2026, 13 juli 2026, etc.
+  const months = INDONESIAN_MONTHS[monthNum] || [];
+  for (const mName of months) {
+    const textPattern = new RegExp(`\\b(?:${dayPadded}|${dayUnpadded})[- ]+${mName}[- ]+${yearStr}\\b`, 'i');
+    if (textPattern.test(text)) return true;
+  }
+
+  return false;
+}
+
+/**
+ * Validates ISO date format and guarantees that deterministic evidence exists in sourceText.
+ */
+export function extractValidatedDate(
+  rawDate: unknown,
+  sourceText: string
+): string | undefined {
+  const sanitized = sanitizeIsoDate(rawDate);
+  if (!sanitized) return undefined;
+  if (!isDateSupportedBySource(sanitized, sourceText)) {
+    return undefined;
+  }
+  return sanitized;
+}
+
+export const STRONG_CALENDAR_KEYWORDS = [
+  'kalender pendidikan',
+  'kaldik',
+  'kalender akademik',
+  'pedoman kalender pendidikan',
+  'kalender kegiatan pendidikan',
+  'kalender pendidikan tahun ajaran',
+  'kalender pendidikan tahun pelajaran',
+  'pedoman kalender',
+  'keputusan kalender',
+  'kalender kegiatan',
+];
+
+export const WEAK_CALENDAR_KEYWORDS = [
+  'tahun ajaran',
+  'tahun pelajaran',
+  'semester ganjil',
+  'semester genap',
+  'hari pertama masuk sekolah',
+  'libur semester',
+  'minggu efektif',
+  'hari efektif',
+];
+
+export const NEGATIVE_ADMISSION_KEYWORDS = [
+  'spmb',
+  'sistem penerimaan murid baru',
+  'penerimaan murid baru',
+  'ppdb',
+  'penerimaan peserta didik baru',
+  'pendaftaran peserta didik',
+  'jalur pendaftaran',
+  'jalur zonasi',
+  'jalur afirmasi',
+  'daya tampung',
+  'hasil seleksi',
+  'seleksi penerimaan',
+  'pendaftaran sekolah',
+];
+
+export interface SourceContentVerificationResult {
+  isValid: boolean;
+  hasCalendarKeyword: boolean;
+  hasStrongCalendarEvidence: boolean;
+  hasWeakCalendarEvidence: boolean;
+  hasNegativeEducationAdmissionEvidence: boolean;
+  hasAcademicYear: boolean;
+  hasGeographicSignal: boolean;
+  rejectionReason?: string;
+}
+
+/**
+ * Normalizes text for calendar evidence matching by lowercasing, removing punctuation,
+ * normalizing dashes/slashes, and collapsing whitespace.
+ */
+export function normalizeCalendarEvidenceText(text: string): string {
+  if (!text || typeof text !== 'string') return '';
+  return text
+    .toLowerCase()
+    .replace(/[,\.;:()\[\]{}"'\\\/]/g, ' ')
+    .replace(/[-_]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+/**
+ * Extracts local evidence context windows (±radius chars) around occurrences of an event date in source text.
+ */
+export function extractLocalEvidenceWindows(
+  sourceText: string,
+  dateStr?: string,
+  windowRadius: number = 250
+): string[] {
+  if (!sourceText) return [];
+  const normalized = normalizeCalendarEvidenceText(sourceText);
+  if (!dateStr || typeof dateStr !== 'string') return [normalized];
+
+  const trimmedDate = dateStr.trim();
+  const datePatterns: string[] = [trimmedDate.toLowerCase()];
+
+  const isoMatch = trimmedDate.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (isoMatch) {
+    const year = isoMatch[1];
+    const monthNum = parseInt(isoMatch[2], 10);
+    const day = parseInt(isoMatch[3], 10).toString();
+    const monthNames = [
+      '', 'januari', 'februari', 'maret', 'april', 'mei', 'juni',
+      'juli', 'agustus', 'september', 'oktober', 'november', 'desember'
+    ];
+    const monthShorts = [
+      '', 'jan', 'feb', 'mar', 'apr', 'mei', 'jun',
+      'jul', 'agu', 'sep', 'okt', 'nov', 'des'
+    ];
+    const monthName = monthNames[monthNum] || '';
+    const monthShort = monthShorts[monthNum] || '';
+
+    if (monthName) {
+      datePatterns.push(`${day} ${monthName} ${year}`);
+      datePatterns.push(`${day} ${monthName}`);
+      datePatterns.push(`${day} ${monthShort} ${year}`);
+      datePatterns.push(`${day} ${monthShort}`);
+    }
+    datePatterns.push(`${day}/${monthNum}/${year}`);
+    datePatterns.push(`${day}-${monthNum}-${year}`);
+    datePatterns.push(`${isoMatch[3]}/${isoMatch[2]}/${year}`);
+    datePatterns.push(`${isoMatch[3]}-${isoMatch[2]}-${year}`);
+  }
+
+  const windows: string[] = [];
+  for (const pat of datePatterns) {
+    let searchFrom = 0;
+    while (searchFrom < normalized.length) {
+      const idx = normalized.indexOf(pat, searchFrom);
+      if (idx === -1) break;
+      const start = Math.max(0, idx - windowRadius);
+      const end = Math.min(normalized.length, idx + pat.length + windowRadius);
+      windows.push(normalized.slice(start, end));
+      searchFrom = idx + pat.length;
+    }
+  }
+
+  if (windows.length === 0) {
+    return [normalized];
+  }
+  return windows;
+}
+
+const EVENT_STOPWORDS = new Set([
+  'dan', 'yang', 'pada', 'tanggal', 'kegiatan', 'hari', 'ke', 'di', 'dari',
+  'sampai', 'dengan', 'sd', 's/d', 'tahun', 'pelajaran', 'ajaran', 'sekolah', 'untuk'
+]);
+
+/**
+ * Validates that an AI-extracted event name is supported by semantic evidence in source text.
+ */
+export function isEventNameSupportedBySource(
+  eventName: string,
+  sourceText: string,
+  eventDate?: string
+): boolean {
+  if (!eventName || !sourceText) return false;
+  const normEvent = normalizeCalendarEvidenceText(eventName);
+  if (!normEvent) return false;
+
+  const rawTokens = normEvent.split(' ').filter(Boolean);
+  const meaningfulTokens = rawTokens.filter((t) => t.length >= 2 && !EVENT_STOPWORDS.has(t));
+  const tokensToCheck = meaningfulTokens.length > 0 ? meaningfulTokens : rawTokens;
+
+  const windows = extractLocalEvidenceWindows(sourceText, eventDate, 250);
+
+  const isHolidaySemantic = tokensToCheck.some((t) => ['libur', 'cuti'].includes(t));
+  const isAssessmentSemantic = tokensToCheck.some((t) =>
+    ['asesmen', 'ujian', 'sumatif', 'pts', 'pas', 'pat', 'sts', 'sas', 'sat', 'ulangan'].includes(t)
+  );
+
+  for (const win of windows) {
+    const winHasHoliday = win.includes('libur') || win.includes('cuti');
+    const winHasAssessment = ['asesmen', 'ujian', 'sumatif', 'pts', 'pas', 'pat', 'sts', 'sas', 'sat', 'ulangan'].some((k) => win.includes(k));
+
+    if (isHolidaySemantic && !winHasHoliday && winHasAssessment) {
+      continue;
+    }
+    if (isAssessmentSemantic && !winHasAssessment && winHasHoliday) {
+      continue;
+    }
+
+    const matched = tokensToCheck.filter((t) => win.includes(t));
+    if (tokensToCheck.length <= 2) {
+      if (matched.length >= 1) {
+        return true;
+      }
+    } else {
+      if (matched.length >= Math.ceil(tokensToCheck.length / 2)) {
+        return true;
+      }
+    }
+  }
+
+  return false;
+}
+
+/**
+ * Derives event category deterministically from evidence in source text and event name.
+ * AI category hint is ignored as authority and defaults to OTHER when semantic evidence is absent.
+ */
+export function deriveEventCategoryFromEvidence(
+  eventName: string,
+  sourceText: string,
+  eventDate?: string,
+  _aiCategoryHint?: string
+): CalendarSourceEvent['category'] {
+  const normEvent = normalizeCalendarEvidenceText(eventName);
+  const windows = extractLocalEvidenceWindows(sourceText, eventDate, 250);
+
+  // 1. Assessment (High priority: "Asesmen Sumatif Akhir Semester" must be ASSESSMENT, not SEMESTER_BREAK)
+  const assessmentKeywords = [
+    'asesmen', 'ujian', 'sumatif', 'pts', 'pas', 'pat', 'sts', 'sas', 'sat', 'ulangan', 'penilaian'
+  ];
+  if (
+    assessmentKeywords.some((k) =>
+      normEvent.includes(k) || windows.some((w) => w.includes(k))
+    )
+  ) {
+    return 'ASSESSMENT';
+  }
+
+  // 2. Mid Semester Break
+  const midSemesterBreakKeywords = [
+    'jeda tengah semester', 'libur tengah semester', 'tengah semester'
+  ];
+  if (
+    midSemesterBreakKeywords.some((k) =>
+      normEvent.includes(k) || windows.some((w) => w.includes(k))
+    )
+  ) {
+    return 'MID_SEMESTER_BREAK';
+  }
+
+  // 3. Semester Break (Requires explicit break/libur evidence, "akhir semester" alone is NOT enough)
+  const semesterBreakKeywords = [
+    'libur semester', 'libur akhir semester', 'jeda semester', 'libur semester ganjil', 'libur semester genap'
+  ];
+  if (
+    semesterBreakKeywords.some((k) =>
+      normEvent.includes(k) || windows.some((w) => w.includes(k))
+    )
+  ) {
+    return 'SEMESTER_BREAK';
+  }
+
+  // 4. School Event
+  const schoolEventKeywords = [
+    'kegiatan sekolah', 'class meeting', 'classmeeting', 'pesantren kilat',
+    'pengenalan lingkungan', 'mpls', 'matsama', 'porseni', 'karya wisata', 'rapat'
+  ];
+  if (
+    schoolEventKeywords.some((k) =>
+      normEvent.includes(k) || windows.some((w) => w.includes(k))
+    )
+  ) {
+    return 'SCHOOL_EVENT';
+  }
+
+  // 5. Holiday
+  const holidayKeywords = [
+    'libur', 'cuti', 'hari libur', 'libur awal ramadhan', 'idul fitri', 'hari raya'
+  ];
+  if (
+    holidayKeywords.some((k) =>
+      normEvent.includes(k) || windows.some((w) => w.includes(k))
+    )
+  ) {
+    return 'HOLIDAY';
+  }
+
+  // 6. Neutral semantic evidence -> OTHER (AI category is never an authority)
+  return 'OTHER';
+}
+
+function escapeRegex(str: string): string {
+  return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/**
+ * Validates exact geographic match according to level.
+ * Distinguishes Kota vs Kabupaten vs directional compounds (e.g. Kota Tangerang vs Kabupaten Tangerang vs Kota Tangerang Selatan).
+ */
+export function checkGeographicMatch(
+  textOrHtml: string,
+  url: string,
+  request: CalendarSearchRequest,
+  level: CalendarSourceLevel
+): boolean {
+  const combined = `${url || ''} ${textOrHtml || ''}`.toLowerCase().replace(/[-_]/g, ' ');
+
+  if (level === 'PROVINCE') {
+    if (!request.province) return true;
+    const provNorm = normalizeRegionName(request.province);
+    if (!provNorm) return true;
+    return combined.includes(provNorm);
+  }
+
+  if (level === 'REGENCY') {
+    if (!request.regency) return true;
+    const rawReq = request.regency.trim().toLowerCase();
+    const isKotaReq = /^kota\b/i.test(rawReq);
+    const isKabReq = /^kab(upaten)?\b/i.test(rawReq);
+
+    const coreName = rawReq
+      .replace(/^kabupaten\s+/i, '')
+      .replace(/^kab\.\s*/i, '')
+      .replace(/^kab\s+/i, '')
+      .replace(/^kota\s+/i, '')
+      .trim();
+
+    if (!coreName || coreName.length < 3) return true;
+
+    // Check directional/compound suffixes that differentiate cities/regencies with common prefixes:
+    const compoundSuffixes = ['selatan', 'barat', 'timur', 'utara', 'tengah', 'hulu', 'hilir', 'daya'];
+    const forbiddenSuffixes = compoundSuffixes.filter((sfx) => !coreName.includes(sfx));
+
+    const forbiddenSuffixPattern = forbiddenSuffixes.length > 0
+      ? `(?!\\s+(?:${forbiddenSuffixes.join('|')})\\b)`
+      : '';
+
+    if (isKotaReq) {
+      // Must match Kota indicators for this coreName and NOT match Kabupaten or forbidden compound suffixes
+      const kotaPatterns = [
+        new RegExp(`\\bkota\\s+${escapeRegex(coreName)}${forbiddenSuffixPattern}\\b`, 'i'),
+        new RegExp(`\\bpemkot\\s+${escapeRegex(coreName)}${forbiddenSuffixPattern}\\b`, 'i'),
+        new RegExp(`\\bkotamadya\\s+${escapeRegex(coreName)}${forbiddenSuffixPattern}\\b`, 'i'),
+        new RegExp(`\\bpemerintah\\s+kota\\s+${escapeRegex(coreName)}${forbiddenSuffixPattern}\\b`, 'i'),
+        new RegExp(`\\bdisdik\\s+kota\\s+${escapeRegex(coreName)}${forbiddenSuffixPattern}\\b`, 'i'),
+        new RegExp(`\\bdinas\\s+pendidikan\\s+kota\\s+${escapeRegex(coreName)}${forbiddenSuffixPattern}\\b`, 'i'),
+        new RegExp(`\\b${escapeRegex(coreName)}\\s+kota${forbiddenSuffixPattern}\\b`, 'i'),
+        new RegExp(`\\b${escapeRegex(coreName.replace(/\s+/g, ''))}kota\\.go\\.id\\b`, 'i'),
+        new RegExp(`\\b${escapeRegex(coreName.replace(/\s+/g, ''))}kota\\b`, 'i'),
+      ];
+
+      return kotaPatterns.some((pat) => pat.test(combined));
+    }
+
+    if (isKabReq) {
+      // Must match Kabupaten indicators for this coreName
+      const kabPatterns = [
+        new RegExp(`\\bkabupaten\\s+${escapeRegex(coreName)}${forbiddenSuffixPattern}\\b`, 'i'),
+        new RegExp(`\\bkab\\.?\\s+${escapeRegex(coreName)}${forbiddenSuffixPattern}\\b`, 'i'),
+        new RegExp(`\\bpemkab\\s+${escapeRegex(coreName)}${forbiddenSuffixPattern}\\b`, 'i'),
+        new RegExp(`\\bpemerintah\\s+kabupaten\\s+${escapeRegex(coreName)}${forbiddenSuffixPattern}\\b`, 'i'),
+        new RegExp(`\\bdisdik\\s+kab(?:upaten)?\\.?\\s+${escapeRegex(coreName)}${forbiddenSuffixPattern}\\b`, 'i'),
+        new RegExp(`\\bdinas\\s+pendidikan\\s+kab(?:upaten)?\\.?\\s+${escapeRegex(coreName)}${forbiddenSuffixPattern}\\b`, 'i'),
+        new RegExp(`\\b${escapeRegex(coreName)}\\s+kabupaten${forbiddenSuffixPattern}\\b`, 'i'),
+        new RegExp(`\\b${escapeRegex(coreName)}\\s+kab${forbiddenSuffixPattern}\\b`, 'i'),
+        new RegExp(`\\b${escapeRegex(coreName.replace(/\s+/g, ''))}kab\\.go\\.id\\b`, 'i'),
+        new RegExp(`\\b${escapeRegex(coreName.replace(/\s+/g, ''))}kab\\b`, 'i'),
+      ];
+
+      return kabPatterns.some((pat) => pat.test(combined));
+    }
+
+    // Default if prefix is unspecified
+    const generalPattern = new RegExp(`\\b${escapeRegex(coreName)}${forbiddenSuffixPattern}\\b`, 'i');
+    return generalPattern.test(combined);
+  }
+
+  return true;
+}
+
+/**
+ * Verifies whether fetched text or page content contains genuine proof
+ * of Indonesian academic calendar regulations for the requested region and academic year.
+ */
+export function verifySourceContentRelevance(
+  textOrHtml: string,
+  url: string,
+  request: CalendarSearchRequest,
+  level: CalendarSourceLevel
+): SourceContentVerificationResult {
+  if (!textOrHtml && !url) {
+    return {
+      isValid: false,
+      hasCalendarKeyword: false,
+      hasStrongCalendarEvidence: false,
+      hasWeakCalendarEvidence: false,
+      hasNegativeEducationAdmissionEvidence: false,
+      hasAcademicYear: false,
+      hasGeographicSignal: false,
+      rejectionReason: 'EMPTY_CONTENT',
+    };
+  }
+
+  const textLower = (textOrHtml || '').toLowerCase();
+  const normalizedText = textLower.replace(/[-_]/g, ' ');
+  const urlLower = (url || '').toLowerCase();
+  const combined = `${urlLower} ${textLower}`;
+  const normalizedCombined = combined.replace(/[-_]/g, ' ');
+
+  // 1. Strong Calendar keywords (REQUIRED from actual fetched content ONLY, not URL)
+  const hasStrongCalendarEvidence = STRONG_CALENDAR_KEYWORDS.some(
+    (kw) => textLower.includes(kw) || normalizedText.includes(kw)
+  );
+
+  // 2. Weak Supporting Calendar keywords
+  const hasWeakCalendarEvidence = WEAK_CALENDAR_KEYWORDS.some(
+    (kw) => combined.includes(kw) || normalizedCombined.includes(kw)
+  );
+
+  // 3. Negative Admission keywords
+  const hasNegativeEducationAdmissionEvidence = NEGATIVE_ADMISSION_KEYWORDS.some(
+    (kw) => combined.includes(kw) || normalizedCombined.includes(kw)
+  );
+
+  // 4. Academic year matching (flexible formats: 2026/2027, 2026-2027, 2026 / 2027, 2026_2027)
+  const reqYear = request.academicYear.trim();
+  const yearVariants: string[] = [reqYear];
+  if (reqYear.includes('/')) {
+    yearVariants.push(reqYear.replace('/', '-'));
+    yearVariants.push(reqYear.replace('/', ' / '));
+    yearVariants.push(reqYear.replace('/', '_'));
+    yearVariants.push(reqYear.replace('/', ' '));
+  }
+  const hasAcademicYear = yearVariants.some((v) => combined.includes(v.toLowerCase()));
+
+  // 5. Geographic signal matching with exact distinction (Kota vs Kabupaten vs compounds)
+  const hasGeographicSignal = checkGeographicMatch(textOrHtml, url, request, level);
+
+  // Strong calendar evidence in fetched content is mandatory. Weak keywords or URL-only terms cannot qualify a candidate.
+  // If strong calendar evidence is absent:
+  // - If negative admission evidence is present -> NON_CALENDAR_EDUCATION_PAGE
+  // - Otherwise -> MISSING_STRONG_CALENDAR_EVIDENCE
+  const isValid = hasStrongCalendarEvidence && hasAcademicYear && hasGeographicSignal;
+
+  let rejectionReason: string | undefined = undefined;
+  if (!hasStrongCalendarEvidence) {
+    if (hasNegativeEducationAdmissionEvidence) {
+      rejectionReason = 'NON_CALENDAR_EDUCATION_PAGE';
+    } else {
+      rejectionReason = 'MISSING_STRONG_CALENDAR_EVIDENCE';
+    }
+  } else if (!hasAcademicYear) {
+    rejectionReason = 'MISSING_ACADEMIC_YEAR';
+  } else if (!hasGeographicSignal) {
+    rejectionReason = 'GEOGRAPHIC_MISMATCH';
+  }
+
+  return {
+    isValid,
+    hasCalendarKeyword: hasStrongCalendarEvidence,
+    hasStrongCalendarEvidence,
+    hasWeakCalendarEvidence,
+    hasNegativeEducationAdmissionEvidence,
+    hasAcademicYear,
+    hasGeographicSignal,
+    rejectionReason,
+  };
+}
+
+/**
+ * Strips HTML tags and script/style content to extract clean plain text for AI processing.
+ */
+export function extractCleanTextFromHtml(html: string): string {
+  if (!html) return '';
+  const text = html
+    .replace(/<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>/gi, ' ')
+    .replace(/<style\b[^<]*(?:(?!<\/style>)<[^<]*)*<\/style>/gi, ' ')
+    .replace(/<(?:br|p|div|h[1-6]|li|tr)\b[^>]*>/gi, '\n')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/&nbsp;/gi, ' ')
+    .replace(/&amp;/gi, '&')
+    .replace(/&lt;/gi, '<')
+    .replace(/&gt;/gi, '>')
+    .replace(/&quot;/gi, '"')
+    .replace(/&#39;/gi, "'");
+
+  return text
+    .replace(/[ \t]+/g, ' ')
+    .replace(/\n\s*\n+/g, '\n')
+    .trim()
+    .slice(0, 10000);
+}
+
+/**
+ * Extracts plain text from a PDF ArrayBuffer or Uint8Array.
+ * Safety: max chars bounded to maxChars (default 50,000).
+ * Fail-closed: returns '' if extraction fails without crashing.
+ */
+export async function extractTextFromPdfBuffer(
+  buffer: ArrayBuffer | Uint8Array,
+  maxChars: number = 50000
+): Promise<string> {
+  try {
+    const loadingTask = pdfjsLib.getDocument({
+      data: buffer instanceof Uint8Array ? buffer : new Uint8Array(buffer),
+      useSystemFonts: true,
+      disableFontFace: true,
+    });
+    const pdfDoc = await loadingTask.promise;
+    const numPages = pdfDoc.numPages;
+    const textParts: string[] = [];
+    let totalLength = 0;
+
+    for (let pageNum = 1; pageNum <= numPages; pageNum++) {
+      const page = await pdfDoc.getPage(pageNum);
+      const content = await page.getTextContent();
+      const pageText = content.items
+        .map((item: any) => (item && 'str' in item ? item.str : ''))
+        .join(' ')
+        .replace(/\s+/g, ' ')
+        .trim();
+
+      if (pageText) {
+        textParts.push(pageText);
+        totalLength += pageText.length;
+        if (totalLength >= maxChars) {
+          break;
+        }
+      }
+    }
+
+    return textParts.join('\n\n').slice(0, maxChars);
+  } catch {
+    return '';
+  }
+}
+
+export interface FetchedSourceContent {
+  ok: boolean;
+  status: number;
+  text: string;
+  rawHtml?: string;
+  finalUrl: string;
+  contentType: string;
+  isPdf: boolean;
+}
+
+export type SourceContentFetcher = (url: string) => Promise<FetchedSourceContent | null>;
+
+/**
+ * Reads a stream of bytes up to maxBytes (default 10 MB).
+ * If total bytes exceed maxBytes, cancels the reader and returns exceeded: true.
+ */
+export async function readBoundedStream(
+  body: ReadableStream<Uint8Array> | null | undefined,
+  maxBytes: number = 10 * 1024 * 1024
+): Promise<{ buffer: Uint8Array | null; exceeded: boolean }> {
+  if (!body) {
+    return { buffer: null, exceeded: false };
+  }
+
+  const reader = body.getReader();
+  const chunks: Uint8Array[] = [];
+  let totalBytes = 0;
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) {
+        break;
+      }
+      if (value) {
+        totalBytes += value.byteLength;
+        if (totalBytes > maxBytes) {
+          try {
+            await reader.cancel('MAX_SIZE_EXCEEDED');
+          } catch {
+            // ignore cancel error
+          }
+          return { buffer: null, exceeded: true };
+        }
+        chunks.push(value);
+      }
+    }
+
+    const merged = new Uint8Array(totalBytes);
+    let offset = 0;
+    for (const chunk of chunks) {
+      merged.set(chunk, offset);
+      offset += chunk.byteLength;
+    }
+    return { buffer: merged, exceeded: false };
+  } catch {
+    try {
+      await reader.cancel();
+    } catch {
+      // ignore
+    }
+    return { buffer: null, exceeded: false };
+  }
+}
+
+/**
+ * Default HTTP fetcher with timeout, size bound, redirect follow, safe HTTPS enforcement, and PDF text extraction.
+ */
+export const defaultSourceContentFetcher: SourceContentFetcher = async (url: string): Promise<FetchedSourceContent | null> => {
+  if (!isSafeCalendarSourceUrl(url)) return null;
+
+  try {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 6000);
+
+    const res = await fetch(url.trim(), {
+      method: 'GET',
+      redirect: 'follow',
+      signal: controller.signal,
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        Accept: 'text/html,application/xhtml+xml,application/pdf,*/*',
+      },
+    });
+    clearTimeout(timeoutId);
+
+    const finalUrl = res.url || url;
+    if (!isSafeCalendarSourceUrl(finalUrl)) {
+      return null;
+    }
+
+    if (!res.ok) {
+      return null;
+    }
+
+    const contentType = (res.headers.get('content-type') || '').toLowerCase();
+    const isPdf = contentType.includes('application/pdf') || finalUrl.toLowerCase().endsWith('.pdf');
+
+    if (isPdf) {
+      const MAX_PDF_BYTES = 10 * 1024 * 1024;
+      // 1. Content-Length Precheck (prevents buffering large bodies)
+      const contentLengthHeader = res.headers.get('content-length');
+      const contentLength = contentLengthHeader ? parseInt(contentLengthHeader, 10) : NaN;
+      if (!Number.isNaN(contentLength) && contentLength > MAX_PDF_BYTES) {
+        return {
+          ok: true,
+          status: res.status,
+          text: '',
+          rawHtml: '',
+          finalUrl,
+          contentType: 'application/pdf',
+          isPdf: true,
+        };
+      }
+
+      // 2. Bounded stream reader
+      try {
+        let pdfBytes: Uint8Array | null = null;
+        if (res.body && typeof res.body.getReader === 'function') {
+          const streamResult = await readBoundedStream(res.body, MAX_PDF_BYTES);
+          if (streamResult.exceeded || !streamResult.buffer) {
+            return {
+              ok: true,
+              status: res.status,
+              text: '',
+              rawHtml: '',
+              finalUrl,
+              contentType: 'application/pdf',
+              isPdf: true,
+            };
+          }
+          pdfBytes = streamResult.buffer;
+        } else {
+          const arrayBuffer = await res.arrayBuffer();
+          if (arrayBuffer.byteLength > MAX_PDF_BYTES) {
+            return {
+              ok: true,
+              status: res.status,
+              text: '',
+              rawHtml: '',
+              finalUrl,
+              contentType: 'application/pdf',
+              isPdf: true,
+            };
+          }
+          pdfBytes = new Uint8Array(arrayBuffer);
+        }
+
+        const extractedText = await extractTextFromPdfBuffer(pdfBytes, 50000);
+        return {
+          ok: true,
+          status: res.status,
+          text: extractedText,
+          rawHtml: '',
+          finalUrl,
+          contentType: 'application/pdf',
+          isPdf: true,
+        };
+      } catch {
+        return {
+          ok: true,
+          status: res.status,
+          text: '',
+          rawHtml: '',
+          finalUrl,
+          contentType: 'application/pdf',
+          isPdf: true,
+        };
+      }
+    }
+
+    const rawText = await res.text();
+    const boundedText = rawText.slice(0, 524288);
+    const cleanText = extractCleanTextFromHtml(boundedText);
+
+    return {
+      ok: true,
+      status: res.status,
+      text: cleanText,
+      rawHtml: boundedText,
+      finalUrl,
+      contentType,
+      isPdf: false,
+    };
+  } catch {
+    return null;
+  }
+};
+
+/**
+ * Extracts and ranks official .go.id links from real HTML of an official seed page.
+ * Bounded to crawl depth 1.
+ */
+export function extractOfficialLinksFromHtml(
+  html: string,
+  baseUrl: string,
+  academicYear: string
+): string[] {
+  if (!html || !baseUrl || typeof html !== 'string') return [];
+
+  const linkRegex = /<a\s+[^>]*href\s*=\s*(?:["']([^"']+)["']|([^\s>]+))[^>]*>([\s\S]*?)<\/a>/gi;
+  const scoredLinks: { url: string; score: number }[] = [];
+  const seenUrls = new Set<string>();
+
+  const yearClean = academicYear.trim();
+  const yearVariants = [
+    yearClean,
+    yearClean.replace('/', '-'),
+    yearClean.replace('/', '_'),
+    yearClean.split('/')[0],
+  ].filter(Boolean);
+
+  let match: RegExpExecArray | null;
+  while ((match = linkRegex.exec(html)) !== null) {
+    const rawHref = (match[1] || match[2] || '').trim();
+    const anchorText = (match[3] || '').replace(/<[^>]+>/g, ' ').toLowerCase();
+
+    if (
+      !rawHref ||
+      rawHref.startsWith('#') ||
+      rawHref.startsWith('javascript:') ||
+      rawHref.startsWith('mailto:') ||
+      rawHref.startsWith('tel:')
+    ) {
+      continue;
+    }
+
+    let resolvedUrl: string;
+    try {
+      const parsed = new URL(rawHref, baseUrl);
+      parsed.hash = '';
+      resolvedUrl = parsed.toString();
+    } catch {
+      continue;
+    }
+
+    if (!isSafeCalendarSourceUrl(resolvedUrl)) {
+      continue;
+    }
+
+    if (seenUrls.has(resolvedUrl)) {
+      continue;
+    }
+    seenUrls.add(resolvedUrl);
+
+    // Scoring
+    const combined = `${resolvedUrl} ${anchorText}`.toLowerCase();
+    const normalizedCombined = combined.replace(/[-_]/g, ' ');
+    let score = 0;
+
+    // Strong Calendar keywords ONLY (entry criterion)
+    let hasStrongKeyword = false;
+    for (const kw of STRONG_CALENDAR_KEYWORDS) {
+      if (combined.includes(kw) || normalizedCombined.includes(kw)) {
+        score += 10;
+        hasStrongKeyword = true;
+      }
+    }
+
+    // Year boost ONLY if strong calendar keyword is present
+    if (hasStrongKeyword) {
+      for (const yv of yearVariants) {
+        if (combined.includes(yv.toLowerCase())) {
+          score += 5;
+        }
+      }
+      scoredLinks.push({ url: resolvedUrl, score });
+    }
+  }
+
+  scoredLinks.sort((a, b) => b.score - a.score);
+  return scoredLinks.map((item) => item.url);
+}
+
+/**
+ * Generates official seed root URLs for a given scope (max 6 seed roots).
+ */
+export function generateOfficialSeedRoots(
+  request: CalendarSearchRequest,
+  level: CalendarSourceLevel
+): string[] {
+  const seeds: string[] = [];
+
+  if (level === 'REGENCY' && request.regency) {
+    const raw = request.regency.toLowerCase().trim();
+    const isKota = raw.startsWith('kota');
+    const core = raw
+      .replace(/^kabupaten\s+/i, '')
+      .replace(/^kab\.\s*/i, '')
+      .replace(/^kota\s+/i, '')
+      .replace(/[^a-z0-9]/g, '');
+
+    const domainSuffix = isKota ? `${core}kota.go.id` : `${core}kab.go.id`;
+    seeds.push(
+      `https://disdik.${domainSuffix}`,
+      `https://dindik.${domainSuffix}`,
+      `https://${domainSuffix}`,
+      `https://jdih.${domainSuffix}`
+    );
+  } else if (level === 'PROVINCE' && request.province) {
+    const rawProv = request.province.toLowerCase().trim();
+    const coreProv = rawProv
+      .replace(/^provinsi\s+/i, '')
+      .replace(/^prov\.\s*/i, '')
+      .replace(/[^a-z0-9]/g, '');
+
+    const provDomain = `${coreProv}prov.go.id`;
+    seeds.push(
+      `https://disdik.${provDomain}`,
+      `https://dindikbud.${provDomain}`,
+      `https://${provDomain}`,
+      `https://jdih.${provDomain}`
+    );
+  } else if (level === 'NATIONAL') {
+    seeds.push(
+      `https://kemendikdasmen.go.id`,
+      `https://kemdikbud.go.id`,
+      `https://jdih.kemdikbud.go.id`
+    );
+  }
+
+  return seeds.filter(isOfficialCalendarSourceUrl).slice(0, 6);
+}
+
+/**
+ * Generates official deterministic candidate URLs based on administrative region names and .go.id conventions.
+ */
+export function generateDeterministicOfficialUrls(
+  request: CalendarSearchRequest,
+  level: CalendarSourceLevel
+): string[] {
+  const urls: string[] = [];
+  const reqYearSlug = request.academicYear.trim().replace('/', '-');
+
+  if (level === 'REGENCY' && request.regency) {
+    const raw = request.regency.toLowerCase().trim();
+    const isKota = raw.startsWith('kota');
+    const core = raw
+      .replace(/^kabupaten\s+/i, '')
+      .replace(/^kab\.\s*/i, '')
+      .replace(/^kota\s+/i, '')
+      .replace(/[^a-z0-9]/g, '');
+
+    const domainSuffix = isKota ? `${core}kota.go.id` : `${core}kab.go.id`;
+    urls.push(
+      `https://disdik.${domainSuffix}/kalender-pendidikan-${reqYearSlug}`,
+      `https://disdik.${domainSuffix}/kaldik-${reqYearSlug}`,
+      `https://disdik.${domainSuffix}/kalender-pendidikan`,
+      `https://${domainSuffix}/kalender-pendidikan-${reqYearSlug}`
+    );
+  } else if (level === 'PROVINCE' && request.province) {
+    const rawProv = request.province.toLowerCase().trim();
+    const coreProv = rawProv
+      .replace(/^provinsi\s+/i, '')
+      .replace(/^prov\.\s*/i, '')
+      .replace(/[^a-z0-9]/g, '');
+
+    const provDomain = `${coreProv}prov.go.id`;
+    urls.push(
+      `https://disdik.${provDomain}/kalender-pendidikan-${reqYearSlug}`,
+      `https://dindikbud.${provDomain}/kalender-pendidikan-${reqYearSlug}`,
+      `https://disdik.${provDomain}/kaldik-${reqYearSlug}`
+    );
+  } else if (level === 'NATIONAL') {
+    urls.push(
+      `https://kemendikdasmen.go.id/pedoman-kalender-pendidikan-${reqYearSlug}`,
+      `https://kemdikbud.go.id/kalender-pendidikan-${reqYearSlug}`
+    );
+  }
+
+  return urls.filter(isOfficialCalendarSourceUrl);
+}
+
+export type PlainGeminiGenerateFn = (
+  prompt: string,
+  model: string
+) => Promise<{ text?: string }>;
+
+export interface TrustedCalendarSearchProviderOptions {
+  apiKey?: string;
+  discoverCandidateUrls?: (request: CalendarSearchRequest, level: CalendarSourceLevel) => Promise<string[]>;
+  generateGroundedContent?: GroundedGenerateFn;
+  generatePlainContent?: PlainGeminiGenerateFn;
+  fetchSourceContent?: SourceContentFetcher;
+  sleep?: (ms: number) => Promise<void>;
+}
+
+/**
+ * Builds Plain Gemini prompt for date extraction from verified source content.
+ * Strictly forbids web search tools and forbids date fabrication.
+ */
+export function buildPlainExtractionPrompt(
+  request: CalendarSearchRequest,
+  level: CalendarSourceLevel,
+  verifiedUrl: string,
+  sourceText: string
+): string {
+  return `Anda adalah sistem ekstraksi fakta resmi Kalender Pendidikan Indonesia.
+Tugas: Ekstrak ketentuan tanggal Kalender Pendidikan Tahun Ajaran ${request.academicYear} HANYA dari teks dokumen resmi yang disediakan di bawah ini.
+
+URL Sumber Terverifikasi: ${verifiedUrl}
+Wilayah: ${level === 'REGENCY' ? request.regency + ', ' + request.province : level === 'PROVINCE' ? request.province : 'Nasional'}
+Tahun Ajaran: ${request.academicYear}
+
+TEKS DOKUMEN:
+"""
+${sourceText.slice(0, 15000)}
+"""
+
+ATURAN KETAT:
+1. EKSTRAK HANYA tanggal dan informasi yang secara eksplisit tertulis dalam teks dokumen di atas.
+2. JANGAN MENGARANG atau menginferensi tanggal, batas semester, nomor SK, atau agenda/libur yang tidak tertulis.
+3. Jika tanggal semester tidak tertulis di teks dokumen, isi dengan string kosong ("") atau null.
+4. Format tanggal harus YYYY-MM-DD.
+5. Untuk events (agenda/libur/asesmen/jeda semester), ekstrak hanya jika nama dan tanggal mulai ada secara eksplisit di teks dokumen.
+   Kategori yang diizinkan: HOLIDAY, SEMESTER_BREAK, MID_SEMESTER_BREAK, ASSESSMENT, SCHOOL_EVENT, OTHER.
+
+Kembalikan HANYA JSON array dengan satu objek:
+[
+  {
+    "province": "${request.province || ''}",
+    "regency": "${request.regency || ''}",
+    "academicYear": "${request.academicYear}",
+    "authority": "Nama Dinas Pendidikan / Instansi Penerbit",
+    "documentTitle": "Judul Dokumen Kalender Pendidikan",
+    "documentNumber": "",
+    "publicationDate": "YYYY-MM-DD",
+    "effectiveDate": "YYYY-MM-DD",
+    "semester1StartDate": "YYYY-MM-DD",
+    "semester1EndDate": "YYYY-MM-DD",
+    "semester2StartDate": "YYYY-MM-DD",
+    "semester2EndDate": "YYYY-MM-DD",
+    "events": [
+      {
+        "name": "Libur Semester Ganjil",
+        "startDate": "YYYY-MM-DD",
+        "endDate": "YYYY-MM-DD",
+        "category": "SEMESTER_BREAK"
+      }
+    ]
+  }
+]`;
+}
+
+/**
+ * Trusted Calendar Search Provider.
+ * Architecture:
+ * 1. Web Discovery via Google Search Grounding (gemini-2.5-flash-lite) with resilient fallback
+ * 2. Safe HTTPS Source Content & Strict Evidence Verification
+ * 3. Deterministic Category & Date Extraction (evidence-bound)
+ * 4. Priority hierarchy: REGENCY OFFICIAL > REGENCY NON_OFFICIAL > PROVINCE OFFICIAL > PROVINCE NON_OFFICIAL > NATIONAL_BASE
+ */
+export class TrustedCalendarSearchProvider implements CalendarDataProvider {
+  private customDiscoverUrls?: (request: CalendarSearchRequest, level: CalendarSourceLevel) => Promise<string[]>;
+  private customGenerateGrounded?: GroundedGenerateFn;
+  private customGeneratePlain?: PlainGeminiGenerateFn;
+  private fetchSource: SourceContentFetcher;
+  private sleepFn: (ms: number) => Promise<void>;
+  private apiKey?: string;
+
+  constructor(options?: TrustedCalendarSearchProviderOptions) {
+    this.customDiscoverUrls = options?.discoverCandidateUrls;
+    this.customGenerateGrounded = options?.generateGroundedContent;
+    this.customGeneratePlain = options?.generatePlainContent;
+    this.fetchSource = options?.fetchSourceContent || defaultSourceContentFetcher;
+    this.sleepFn = options?.sleep || ((ms: number) => new Promise((resolve) => setTimeout(resolve, ms)));
+    this.apiKey = options?.apiKey || process.env.GEMINI_API_KEY;
+  }
+
+  private getAIClient(): GoogleGenAI | null {
+    const key = this.apiKey || process.env.GEMINI_API_KEY;
+    if (!key) return null;
+    return new GoogleGenAI({
+      apiKey: key,
+      httpOptions: {
+        headers: { 'User-Agent': 'aistudio-build' },
+      },
+    });
+  }
+
+  /**
+   * Primary Web Discovery using Google Search Grounding with gemini-2.5-flash-lite.
+   * Tolerates 429/quota/temporary errors without failing the overall search.
+   */
+  private async discoverCandidateUrlsWithGrounding(
+    request: CalendarSearchRequest,
+    level: CalendarSourceLevel,
+    modelAttempts: CalendarModelAttemptDiagnostic[]
+  ): Promise<string[]> {
+    const targetRegion = level === 'REGENCY'
+      ? `${request.regency || ''} ${request.province || ''}`
+      : level === 'PROVINCE'
+      ? (request.province || '')
+      : 'Nasional';
+
+    const searchQuery = level === 'REGENCY'
+      ? `Kalender Pendidikan ${request.regency || ''} ${request.province || ''} ${request.academicYear}`
+      : level === 'PROVINCE'
+      ? `Kalender Pendidikan ${request.province || ''} ${request.academicYear}`
+      : `Kalender Pendidikan Nasional ${request.academicYear}`;
+
+    const prompt = `Cari informasi dan tautan dokumen Kalender Pendidikan (Kaldik) Tahun Ajaran ${request.academicYear} untuk:
+Wilayah: ${targetRegion}
+Tingkat: ${level}
+Kata Kunci Pencarian: ${searchQuery}
+
+Kembalikan tautan sumber web yang memuat kalender pendidikan atau jadwal tahun ajaran ${request.academicYear}.`;
+
+    if (this.customGenerateGrounded) {
+      try {
+        const res = await this.customGenerateGrounded(prompt, 'gemini-2.5-flash-lite');
+        modelAttempts.push({ model: 'gemini-2.5-flash-lite', status: 'SUCCESS' });
+        const rawSources = extractGroundedWebSources(res);
+        const groundedUrls = rawSources.map((s) => s.uri).filter(isSafeCalendarSourceUrl);
+        const textUrls = this.parseUrlsFromJson(res.text || '');
+        return Array.from(new Set([...groundedUrls, ...textUrls]));
+      } catch (err) {
+        modelAttempts.push({
+          model: 'gemini-2.5-flash-lite',
+          status: 'ERROR',
+          errorCategory: sanitizeErrorCategory(err),
+        });
+        return [];
+      }
+    }
+
+    const ai = this.getAIClient();
+    if (!ai) return [];
+
+    const modelsToTry = ['gemini-2.5-flash-lite', 'gemini-3.8-flash'];
+    for (const model of modelsToTry) {
+      try {
+        const response = await ai.models.generateContent({
+          model,
+          contents: prompt,
+          config: {
+            tools: [{ googleSearch: {} }],
+          },
+        });
+
+        modelAttempts.push({ model, status: 'SUCCESS' });
+        const rawSources = extractGroundedWebSources(response);
+        const groundedUrls = rawSources.map((s) => s.uri).filter(isSafeCalendarSourceUrl);
+        const textUrls = this.parseUrlsFromJson(response.text || '');
+        const combined = Array.from(new Set([...groundedUrls, ...textUrls]));
+        if (combined.length > 0) {
+          return combined;
+        }
+      } catch (err: any) {
+        modelAttempts.push({
+          model,
+          status: 'ERROR',
+          errorCategory: sanitizeErrorCategory(err),
+        });
+        // 429/quota/tools error: do not crash or throw, proceed to next model or fallback discovery!
+        continue;
+      }
+    }
+
+    return [];
+  }
+
+  /**
+   * Plain Gemini helper for candidate URL discovery (WITHOUT Google Search tools).
+   */
+  private async discoverCandidateUrlsWithAI(
+    request: CalendarSearchRequest,
+    level: CalendarSourceLevel,
+    modelAttempts: CalendarModelAttemptDiagnostic[]
+  ): Promise<string[]> {
+    const targetRegion = level === 'REGENCY'
+      ? `${request.regency}, ${request.province}`
+      : level === 'PROVINCE'
+      ? request.province
+      : 'Nasional';
+
+    const prompt = `Sebutkan 3-6 URL resmi pemerintah Republik Indonesia (domain .go.id) dari Dinas Pendidikan, Pemerintah Daerah, atau JDIH yang berpotensi memuat Kalender Pendidikan Tahun Ajaran ${request.academicYear} untuk:
+Wilayah: ${targetRegion}
+Tingkat: ${level}
+
+Ketentuan:
+1. Hanya sertakan URL dengan protokol HTTPS dan domain berakhiran .go.id.
+2. JANGAN menggunakan domain non-pemerintah.
+3. Kembalikan HANYA JSON array string URL:
+["https://..."]`;
+
+    if (this.customGeneratePlain) {
+      try {
+        const res = await this.customGeneratePlain(prompt, 'gemini-3.5-flash-lite');
+        modelAttempts.push({ model: 'gemini-3.5-flash-lite', status: 'SUCCESS' });
+        return this.parseUrlsFromJson(res.text || '');
+      } catch (err) {
+        modelAttempts.push({
+          model: 'gemini-3.5-flash-lite',
+          status: 'ERROR',
+          errorCategory: sanitizeErrorCategory(err),
+        });
+        return [];
+      }
+    }
+
+    const ai = this.getAIClient();
+    if (!ai) return [];
+
+    const modelsToTry = ['gemini-3.5-flash-lite', 'gemini-3.8-flash'];
+
+    for (const model of modelsToTry) {
+      try {
+        // Plain generation WITHOUT tools
+        const response = await ai.models.generateContent({
+          model,
+          contents: prompt,
+        });
+
+        modelAttempts.push({ model, status: 'SUCCESS' });
+        const urls = this.parseUrlsFromJson(response.text || '');
+        if (urls.length > 0) {
+          return urls;
+        }
+      } catch (err) {
+        modelAttempts.push({
+          model,
+          status: 'ERROR',
+          errorCategory: sanitizeErrorCategory(err),
+        });
+        continue;
+      }
+    }
+
+    return [];
+  }
+
+  private parseUrlsFromJson(rawText: string): string[] {
+    if (!rawText) return [];
+    let text = rawText.trim();
+    if (text.includes('```json')) {
+      text = text.slice(text.indexOf('```json') + 7);
+      if (text.includes('```')) text = text.slice(0, text.indexOf('```'));
+    } else if (text.includes('```')) {
+      text = text.slice(text.indexOf('```') + 3);
+      if (text.includes('```')) text = text.slice(0, text.indexOf('```'));
+    }
+    text = text.trim();
+
+    try {
+      const parsed = JSON.parse(text);
+      if (Array.isArray(parsed)) {
+        return parsed
+          .filter((item): item is string => typeof item === 'string' && isSafeCalendarSourceUrl(item))
+          .map((s) => s.trim());
+      }
+    } catch {
+      // Extract urls by regex if JSON parsing fails
+      const matches = [...text.matchAll(/https:\/\/[a-zA-Z0-9\.\-_]+[^\s\"'<>]+/g)].map((m) => m[0]);
+      return matches.filter(isSafeCalendarSourceUrl);
+    }
+    return [];
+  }
+
+  /**
+   * Plain Gemini extractor to extract dates from verified official content.
+   */
+  private async extractCandidateFromVerifiedSource(
+    request: CalendarSearchRequest,
+    level: CalendarSourceLevel,
+    verifiedUrl: string,
+    sourceText: string,
+    modelAttempts: CalendarModelAttemptDiagnostic[]
+  ): Promise<CalendarSourceCandidate> {
+    const isOfficial = isOfficialCalendarSourceUrl(verifiedUrl);
+    const authorityType: CalendarSourceAuthorityType = isOfficial ? 'OFFICIAL' : 'NON_OFFICIAL';
+    const confidence: 'HIGH' | 'MEDIUM' = isOfficial ? 'HIGH' : 'MEDIUM';
+
+    const fallbackCandidate: CalendarSourceCandidate = {
+      sourceLevel: level,
+      authorityType,
+      confidence,
+      province: level === 'NATIONAL' ? undefined : request.province,
+      regency: level === 'REGENCY' ? request.regency : undefined,
+      academicYear: request.academicYear.trim(),
+      authority:
+        level === 'REGENCY'
+          ? `Dinas Pendidikan ${request.regency || ''}`
+          : level === 'PROVINCE'
+          ? `Dinas Pendidikan ${request.province || ''}`
+          : 'Kementerian Pendidikan Dasar dan Menengah RI',
+      documentTitle: `Kalender Pendidikan Tahun Ajaran ${request.academicYear}`,
+      sourceUrl: verifiedUrl,
+      verificationStatus: 'PARTIAL',
+      retrievedAt: new Date().toISOString(),
+    };
+
+    if (!sourceText || sourceText.trim().length === 0) {
+      return fallbackCandidate;
+    }
+
+    const prompt = buildPlainExtractionPrompt(request, level, verifiedUrl, sourceText);
+
+    let rawOutput = '';
+    if (this.customGeneratePlain) {
+      try {
+        const res = await this.customGeneratePlain(prompt, 'gemini-3.5-flash-lite');
+        modelAttempts.push({ model: 'gemini-3.5-flash-lite', status: 'SUCCESS' });
+        rawOutput = res.text || '';
+      } catch (err) {
+        modelAttempts.push({
+          model: 'gemini-3.5-flash-lite',
+          status: 'ERROR',
+          errorCategory: sanitizeErrorCategory(err),
+        });
+        return fallbackCandidate;
+      }
+    } else {
+      const ai = this.getAIClient();
+      if (!ai) return fallbackCandidate;
+
+      const modelsToTry = ['gemini-3.5-flash-lite', 'gemini-3.8-flash'];
+      for (const model of modelsToTry) {
+        try {
+          const response = await ai.models.generateContent({
+            model,
+            contents: prompt,
+          });
+          modelAttempts.push({ model, status: 'SUCCESS' });
+          rawOutput = response.text || '';
+          break;
+        } catch (err) {
+          modelAttempts.push({
+            model,
+            status: 'ERROR',
+            errorCategory: sanitizeErrorCategory(err),
+          });
+          continue;
+        }
+      }
+    }
+
+    if (!rawOutput) return fallbackCandidate;
+
+    let text = rawOutput.trim();
+    if (text.includes('```json')) {
+      text = text.slice(text.indexOf('```json') + 7);
+      if (text.includes('```')) text = text.slice(0, text.indexOf('```'));
+    } else if (text.includes('```')) {
+      text = text.slice(text.indexOf('```') + 3);
+      if (text.includes('```')) text = text.slice(0, text.indexOf('```'));
+    }
+    text = text.trim();
+
+    try {
+      const parsed = JSON.parse(text);
+      if (Array.isArray(parsed) && parsed.length > 0 && typeof parsed[0] === 'object') {
+        const item = parsed[0];
+
+        // Parse and validate structured events from AI against source text
+        const rawEvents = Array.isArray(item.events) ? item.events : [];
+        const validatedEvents: CalendarSourceEvent[] = [];
+
+        const allowedCategories: CalendarSourceEvent['category'][] = [
+          'HOLIDAY',
+          'SEMESTER_BREAK',
+          'MID_SEMESTER_BREAK',
+          'ASSESSMENT',
+          'SCHOOL_EVENT',
+          'OTHER',
+        ];
+
+        for (const ev of rawEvents) {
+          if (!ev || typeof ev !== 'object') continue;
+          const name = typeof ev.name === 'string' ? ev.name.trim() : '';
+          if (!name) continue;
+
+          // Validate startDate against sourceText
+          const validStart = extractValidatedDate(ev.startDate, sourceText);
+          if (!validStart) {
+            // If startDate is not supported by source text, discard the entire event
+            continue;
+          }
+
+          // Validate event name against sourceText (semantic evidence)
+          const isNameValid = isEventNameSupportedBySource(name, sourceText, validStart);
+          if (!isNameValid) {
+            // If event name is not supported by source text, discard the entire event
+            continue;
+          }
+
+          // Validate endDate against sourceText if provided
+          let validEnd: string | undefined = undefined;
+          if (ev.endDate) {
+            validEnd = extractValidatedDate(ev.endDate, sourceText);
+          }
+
+          // Derive event category deterministically from evidence in source text (AI category is hint only)
+          const category = deriveEventCategoryFromEvidence(
+            name,
+            sourceText,
+            validStart,
+            typeof ev.category === 'string' ? ev.category : undefined
+          );
+
+          validatedEvents.push({
+            name,
+            startDate: validStart,
+            endDate: validEnd,
+            category,
+          });
+        }
+
+        return {
+          sourceLevel: level,
+          authorityType,
+          confidence,
+          province: level === 'NATIONAL' ? undefined : (typeof item.province === 'string' && item.province.trim() ? item.province.trim() : request.province),
+          regency: level === 'REGENCY' ? (typeof item.regency === 'string' && item.regency.trim() ? item.regency.trim() : request.regency) : undefined,
+          academicYear: request.academicYear.trim(),
+          authority: typeof item.authority === 'string' && item.authority.trim() ? item.authority.trim() : fallbackCandidate.authority,
+          documentTitle: typeof item.documentTitle === 'string' && item.documentTitle.trim() ? item.documentTitle.trim() : fallbackCandidate.documentTitle,
+          documentNumber: typeof item.documentNumber === 'string' && item.documentNumber.trim() ? item.documentNumber.trim() : undefined,
+          sourceUrl: verifiedUrl, // Source of truth: verified HTTP URL, cannot be hallucinated
+          publicationDate: extractValidatedDate(item.publicationDate, sourceText),
+          effectiveDate: extractValidatedDate(item.effectiveDate, sourceText),
+          semester1StartDate: extractValidatedDate(item.semester1StartDate, sourceText),
+          semester1EndDate: extractValidatedDate(item.semester1EndDate, sourceText),
+          semester2StartDate: extractValidatedDate(item.semester2StartDate, sourceText),
+          semester2EndDate: extractValidatedDate(item.semester2EndDate, sourceText),
+          semesterStartDate: extractValidatedDate(item.semesterStartDate || item.semester1StartDate, sourceText),
+          semesterEndDate: extractValidatedDate(item.semesterEndDate || item.semester2EndDate, sourceText),
+          events: validatedEvents.length > 0 ? validatedEvents : undefined,
+          verificationStatus: 'PARTIAL',
+          retrievedAt: new Date().toISOString(),
+        };
+      }
+    } catch {
+      // Fall through to fallback candidate
+    }
+
+    return fallbackCandidate;
+  }
+
+  /**
+   * Searches for calendar source candidates while recording granular runtime diagnostic metadata across resolution stages.
+   */
+  async searchWithDiagnostics(request: CalendarSearchRequest): Promise<CalendarSearchResultWithDiagnostics> {
+    const isAiConfigured = Boolean(this.apiKey || this.customGeneratePlain || process.env.GEMINI_API_KEY);
+
+    if (!request || !request.academicYear || request.academicYear.trim() === '') {
+      return {
+        candidates: [],
+        diagnostic: {
+          aiConfigured: isAiConfigured,
+          reason: 'NO_OFFICIAL_SOURCE',
+          stages: [],
+        },
+      };
+    }
+
+    const stages: CalendarStageDiagnostic[] = [];
+    let acceptedCandidates: CalendarSourceCandidate[] = [];
+
+    const runStage = async (level: CalendarSourceLevel): Promise<boolean> => {
+      const modelAttempts: CalendarModelAttemptDiagnostic[] = [];
+      const attemptedUrls = new Set<string>();
+      const candidateUrlsAttempted = new Set<string>();
+      let verifiedCount = 0;
+      const stageCandidates: CalendarSourceCandidate[] = [];
+
+      const verifyCandidateUrls = async (urls: string[], isDiscovered: boolean): Promise<boolean> => {
+        const freshUrls: string[] = [];
+        for (const u of urls) {
+          const trimmed = u ? u.trim() : '';
+          if (trimmed && isSafeCalendarSourceUrl(trimmed) && !attemptedUrls.has(trimmed)) {
+            freshUrls.push(trimmed);
+          }
+        }
+
+        // Sort so that OFFICIAL (.go.id) URLs are fetched and evaluated first
+        const sortedUrls = [...freshUrls].sort((a, b) => {
+          const aOff = isOfficialCalendarSourceUrl(a) ? 0 : 1;
+          const bOff = isOfficialCalendarSourceUrl(b) ? 0 : 1;
+          return aOff - bOff;
+        });
+
+        const urlsToTry = sortedUrls.slice(0, 10);
+        for (const url of urlsToTry) {
+          attemptedUrls.add(url);
+          if (isDiscovered) {
+            candidateUrlsAttempted.add(url);
+          }
+
+          const fetched = await this.fetchSource(url);
+          if (!fetched || !fetched.ok) {
+            continue;
+          }
+
+          candidateUrlsAttempted.add(url);
+
+          const relevance = verifySourceContentRelevance(fetched.text, fetched.finalUrl, request, level);
+          if (!relevance.isValid) {
+            continue;
+          }
+
+          verifiedCount++;
+
+          // Extract candidate (evidence-bound)
+          const candidate = await this.extractCandidateFromVerifiedSource(
+            request,
+            level,
+            fetched.finalUrl,
+            fetched.text,
+            modelAttempts
+          );
+
+          stageCandidates.push(candidate);
+          // If candidate is OFFICIAL, we can short-circuit this candidate batch immediately
+          if (candidate.authorityType === 'OFFICIAL') {
+            return true;
+          }
+        }
+
+        return stageCandidates.some((c) => c.authorityType === 'OFFICIAL');
+      };
+
+      const hasOfficialCandidate = (): boolean => {
+        return stageCandidates.some((c) => c.authorityType === 'OFFICIAL');
+      };
+
+      // PASS 1A: Google Search Grounding Discovery (primary)
+      const discoveredUrls: string[] = [];
+      const deterministicUrls: string[] = [];
+
+      if (this.customDiscoverUrls) {
+        try {
+          const customUrls = await this.customDiscoverUrls(request, level);
+          if (Array.isArray(customUrls)) {
+            discoveredUrls.push(...customUrls);
+          }
+        } catch {
+          // ignore custom discovery errors
+        }
+      } else {
+        if (isAiConfigured) {
+          const groundingUrls = await this.discoverCandidateUrlsWithGrounding(request, level, modelAttempts);
+          discoveredUrls.push(...groundingUrls);
+        }
+
+        // PASS 1B: Seed roots + real HTML link extraction
+        const seedRoots = generateOfficialSeedRoots(request, level);
+        for (const seedUrl of seedRoots) {
+          try {
+            const fetchedSeed = await this.fetchSource(seedUrl);
+            if (fetchedSeed && fetchedSeed.ok) {
+              const seedRelevance = verifySourceContentRelevance(fetchedSeed.text, fetchedSeed.finalUrl, request, level);
+              if (seedRelevance.isValid) {
+                discoveredUrls.push(fetchedSeed.finalUrl);
+              }
+
+              const htmlContent = fetchedSeed.rawHtml || fetchedSeed.text;
+              const extractedLinks = extractOfficialLinksFromHtml(htmlContent, fetchedSeed.finalUrl, request.academicYear);
+              discoveredUrls.push(...extractedLinks);
+            }
+          } catch {
+            // ignore seed fetch error
+          }
+        }
+
+        // Deterministic candidate URLs
+        deterministicUrls.push(...generateDeterministicOfficialUrls(request, level));
+      }
+
+      // Execute PASS 1: Grounding & Seeds
+      await verifyCandidateUrls(discoveredUrls, true);
+
+      // If no OFFICIAL candidate found yet, continue to deterministic pass
+      if (!hasOfficialCandidate() && deterministicUrls.length > 0) {
+        await verifyCandidateUrls(deterministicUrls, false);
+      }
+
+      // PASS 2: If we still don't have an OFFICIAL candidate, trigger Plain Gemini URL discovery as fallback
+      if (!hasOfficialCandidate() && isAiConfigured) {
+        const aiUrls = await this.discoverCandidateUrlsWithAI(request, level, modelAttempts);
+        if (aiUrls.length > 0) {
+          await verifyCandidateUrls(aiUrls, true);
+        }
+      }
+
+      const rawCandidateCount = candidateUrlsAttempted.size;
+      const responseReceived = verifiedCount > 0 || modelAttempts.some((m) => m.status === 'SUCCESS');
+      const textPresent = stageCandidates.length > 0;
+      const acceptedCandidateCount = stageCandidates.length;
+
+      const stageDiag: CalendarStageDiagnostic = {
+        level,
+        modelAttempts,
+        responseReceived,
+        textPresent,
+        rawCandidateCount,
+        groundingSourceCount: rawCandidateCount,
+        resolvedGroundingCount: verifiedCount,
+        acceptedCandidateCount,
+        discoveredUrlCount: discoveredUrls.length,
+        fetchedUrlCount: candidateUrlsAttempted.size,
+      };
+
+      stages.push(stageDiag);
+
+      if (stageCandidates.length > 0) {
+        // Sort stage candidates: OFFICIAL > NON_OFFICIAL, VERIFIED > PARTIAL
+        stageCandidates.sort((a, b) => {
+          const aAuth = (a.authorityType || classifyCalendarSourceAuthority(a.sourceUrl)) === 'NON_OFFICIAL' ? 1 : 0;
+          const bAuth = (b.authorityType || classifyCalendarSourceAuthority(b.sourceUrl)) === 'NON_OFFICIAL' ? 1 : 0;
+          if (aAuth !== bAuth) return aAuth - bAuth;
+          const aVer = a.verificationStatus === 'VERIFIED' ? 0 : 1;
+          const bVer = b.verificationStatus === 'VERIFIED' ? 0 : 1;
+          return aVer - bVer;
+        });
+
+        acceptedCandidates = stageCandidates;
+        return true; // Short-circuit!
+      }
+
+      return false;
+    };
+
+    // 1. Stage: REGENCY
+    if (request.regency && request.province) {
+      const found = await runStage('REGENCY');
+      if (found) {
+        return {
+          candidates: acceptedCandidates,
+          diagnostic: {
+            aiConfigured: isAiConfigured,
+            reason: 'SUCCESS',
+            stages,
+          },
+        };
+      }
+    }
+
+    // 2. Stage: PROVINCE
+    if (request.province) {
+      const found = await runStage('PROVINCE');
+      if (found) {
+        return {
+          candidates: acceptedCandidates,
+          diagnostic: {
+            aiConfigured: isAiConfigured,
+            reason: 'SUCCESS',
+            stages,
+          },
+        };
+      }
+    }
+
+    // 3. Stage: NATIONAL
+    const foundNat = await runStage('NATIONAL');
+    if (foundNat) {
+      return {
+        candidates: acceptedCandidates,
+        diagnostic: {
+          aiConfigured: isAiConfigured,
+          reason: 'SUCCESS',
+          stages,
+        },
+      };
+    }
+
+    // Evaluate diagnostic reason if no online candidates accepted
+    let reason: CalendarSearchDiagnosticReason = 'NO_OFFICIAL_SOURCE';
+
+    const allModelAttemptsFailed =
+      stages.length > 0 &&
+      stages.some((s) => s.modelAttempts.length > 0) &&
+      stages.every((s) => s.modelAttempts.length > 0 && s.modelAttempts.every((m) => m.status === 'ERROR'));
+
+    const totalRawCandidates = stages.reduce((acc, s) => acc + s.rawCandidateCount, 0);
+
+    if (allModelAttemptsFailed && totalRawCandidates === 0) {
+      reason = 'MODEL_FAILURE';
+    } else if (totalRawCandidates > 0) {
+      reason = 'CANDIDATE_REJECTED';
+    } else {
+      reason = 'NO_OFFICIAL_SOURCE';
+    }
+
+    // Never return empty calendar: attach National Base candidate
+    const nationalBaseCandidate = buildNationalBaseCandidate(request.academicYear);
+
+    return {
+      candidates: [nationalBaseCandidate],
+      diagnostic: {
+        aiConfigured: isAiConfigured,
+        reason,
+        stages,
+      },
+    };
+  }
+
+  async search(request: CalendarSearchRequest): Promise<CalendarSourceCandidate[]> {
+    const result = await this.searchWithDiagnostics(request);
+    return result.candidates;
+  }
+}
