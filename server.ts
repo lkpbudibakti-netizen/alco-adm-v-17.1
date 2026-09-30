@@ -1465,19 +1465,27 @@ app.post('/api/ai/review-assessment-quality', async (req, res) => {
   try {
     const ai = createAIClient(apiKey);
     const systemInstruction = `Anda adalah AI Quality Reviewer profesional untuk kurikulum dan perangkat asesmen di Indonesia.
-Tugas Anda adalah menelaah kualitas butir dan instrumen asesmen yang dirancang.
+Tugas Anda adalah menelaah kualitas butir dan instrumen asesmen yang dirancang berdasarkan konten pedagogis nyata, bukan hanya kecocokan ID.
+
+PRINSIP PENJALAJARAN PEDAGOGIS (ALUR ALIGNMENT):
+Pahami relasi penurunan berikut dalam setiap butir asesmen:
+TP / Objective (tujuan pembelajaran umum)
+  → Criterion / KKTP (kriteria ketercapaian tujuan pembelajaran)
+    → Assessment Indicator (indikator spesifik apa yang diukur pada butir)
+      → Item Soal / Task (pertanyaan/tugas yang dikerjakan murid)
+        → Cognitive Demand (tingkat proses kognitif: RECALL_UNDERSTAND, APPLY, ANALYZE_REASON, EVALUATE_CREATE)
 
 Dimensi evaluasi kualitas:
-1. CONTENT_ALIGNMENT: Keselarasan materi butir dengan tujuan pembelajaran / materi kurikulum.
-2. COGNITIVE_ALIGNMENT: Keselarasan tingkat kognitif butir dengan target kognitif.
-3. ITEM_CONSTRUCTION: Kualitas konstruksi butir soal (kejelasan pokok soal, tidak ambigu, tidak memberi petunjuk jawaban).
-4. STIMULUS_QUALITY: Kualitas dan relevansi stimulus (jika ada stimulus).
+1. CONTENT_ALIGNMENT: Keselarasan materi butir soal dengan isi teks TP/objective, criterion/KKTP, dan indikator asesmen (assessmentIndicator). Butir soal harus benar-benar menguji kompetensi dan materi yang ditargetkan, bukan sekadar cocok ID.
+2. COGNITIVE_ALIGNMENT: Keselarasan tingkat kognitif butir soal dengan target kognitif (cognitiveDemand) yang direncanakan. Soal pemahaman/ingatan tidak boleh dilabeli atau menguji penalaran tingkat tinggi, begitu pula sebaliknya.
+3. ITEM_CONSTRUCTION: Kualitas konstruksi butir soal (kejelasan pokok soal/stem, tidak ambigu, tidak memberi petunjuk jawaban, opsi homogen).
+4. STIMULUS_QUALITY: Kualitas dan relevansi stimulus dengan pertanyaan (jika ada stimulus).
 5. ANSWER_VERIFICATION: Kepastian kunci jawaban dan objektivitas penskoran.
-6. DISTRACTOR_QUALITY: Kualitas pilihan pengecoh (hanya untuk butir yang memiliki opsi pilihan ganda).
+6. DISTRACTOR_QUALITY: Kualitas dan efektivitas pilihan pengecoh (hanya untuk butir yang memiliki opsi pilihan ganda).
 7. GRADE_LANGUAGE: Kesesuaian bahasa, keterbacaan, dan istilah dengan fase/tingkat kelas murid.
 8. SENSITIVITY: Bebas dari bias SARA, diskriminasi gender, politik praktis, atau kekerasan.
-9. TRACEABILITY: Keterlacakan pemetaan butir ke kisi-kisi asesmen.
-10. DUPLICATION: Tidak ada pengulangan atau duplikasi butir soal.
+9. TRACEABILITY: Keterlacakan pemetaan butir ke kisi-kisi asesmen (keterkaitan item ke kisi-kisi dan indikator).
+10. DUPLICATION: Tidak ada pengulangan atau duplikasi materi dan butir soal.
 
 ATURAN TARGET ID SANGAT PENTING:
 - Setiap finding untuk butir soal WAJIB menyertakan 'instrumentItemId' yang SAMA PERSIS dengan ID butir soal yang dievaluasi.
@@ -1487,16 +1495,56 @@ ATURAN TARGET ID SANGAT PENTING:
   - 'PASS': Memenuhi standar kualitas dengan baik.
   - 'REVIEW': Terdapat catatan atau saran perbaikan minor yang perlu ditinjau guru.
   - 'FAIL': Terdapat pelanggaran kaidah penulisan fatal yang perlu diganti/diperbaiki.
-- 'reason': Penjelasan singkat dan konstruktif.`;
+- 'reason': Penjelasan singkat dan konstruktif dengan merujuk isi pedagogis (tujuan, materi, atau tingkat kognitif).`;
 
-    const compactBlueprint = (assessmentPackage.blueprintItems || []).map((bp: any) => ({
-      id: bp.id,
-      coverageUnitId: bp.coverageUnitId,
-      objectiveRefId: bp.objectiveRefId,
-      instrumentType: bp.instrumentType,
-      cognitiveDemand: bp.cognitiveDemand,
-      difficultyTarget: bp.difficultyTarget,
-    }));
+    const objectivesList = generationPlan?.generationSpec?.objectives || [];
+    const criteriaList = generationPlan?.generationSpec?.criteria || [];
+    const coverageUnitsList = generationPlan?.coverageUnits || [];
+
+    const objMap = new Map<string, string>();
+    for (const obj of objectivesList) {
+      if (obj && obj.id) {
+        objMap.set(obj.id, obj.text || (obj as any).statement || '');
+      }
+    }
+
+    const critMap = new Map<string, string>();
+    for (const crit of criteriaList) {
+      if (crit && crit.id) {
+        const text = crit.description
+          ? (crit.name ? `${crit.name}: ${crit.description}` : crit.description)
+          : (crit.name || '');
+        critMap.set(crit.id, text);
+      }
+    }
+
+    const covMap = new Map<string, any>();
+    for (const cu of coverageUnitsList) {
+      if (cu && cu.id) {
+        covMap.set(cu.id, cu);
+      }
+    }
+
+    const compactBlueprint = (assessmentPackage.blueprintItems || []).map((bp: any) => {
+      const cov = bp.coverageUnitId ? covMap.get(bp.coverageUnitId) : undefined;
+      const objectiveText = bp.objectiveText || objMap.get(bp.objectiveRefId) || (cov ? objMap.get(cov.objectiveRefId) : undefined) || undefined;
+      const criterionText = bp.criterionText || (bp.criterionId ? critMap.get(bp.criterionId) : undefined) || (cov?.criterionId ? critMap.get(cov.criterionId) : undefined) || undefined;
+      const assessmentIndicator = bp.assessmentIndicator || cov?.assessmentIndicator || undefined;
+      const materialOrContext = bp.materialOrContext || cov?.materialOrContext || undefined;
+
+      return {
+        id: bp.id,
+        coverageUnitId: bp.coverageUnitId,
+        objectiveRefId: bp.objectiveRefId,
+        objectiveText,
+        criterionText,
+        assessmentIndicator,
+        materialOrContext,
+        instrumentType: bp.instrumentType,
+        cognitiveDemand: bp.cognitiveDemand,
+        difficultyTarget: bp.difficultyTarget,
+      };
+    });
 
     const compactInstruments = (assessmentPackage.instruments || []).map((inst: any) => ({
       id: inst.id,
@@ -1514,15 +1562,17 @@ ATURAN TARGET ID SANGAT PENTING:
       aspects: inst.aspects,
     }));
 
-    const userPrompt = `Lakukan telaah kualitas untuk perangkat asesmen berikut:
-Judul: ${assessmentPackage.title || '-'}
+    const userPrompt = `Lakukan telaah kualitas untuk perangkat asesmen berikut berdasarkan keterkaitan pedagogis:
+[TP/objective → criterion/KKTP → assessmentIndicator → item → cognitiveDemand]
+
+Judul Perangkat: ${assessmentPackage.title || '-'}
 Kalibrasi Kelas: ${JSON.stringify(gradeCalibration || {}, null, 2)}
 Profil Subjek: ${JSON.stringify(subjectProfile || {}, null, 2)}
 
-Kisi-Kisi (Blueprint):
+Kisi-Kisi Asesmen (Blueprint dengan teks rujukan TP, KKTP, Indikator, dan Target Kognitif):
 ${JSON.stringify(compactBlueprint, null, 2)}
 
-Instrumen & Butir Soal:
+Instrumen & Butir Soal yang Dinilai:
 ${JSON.stringify(compactInstruments, null, 2)}
 
 Berikan evaluasi kualitas untuk butir-butir soal dan instrumen tersebut dalam format JSON sesuai schema.`;
