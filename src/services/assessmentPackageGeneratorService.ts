@@ -1011,6 +1011,46 @@ export function parseAndValidateRawAIResponse(
               return;
             }
 
+            let candidateCognitiveDemand: string | undefined = undefined;
+            if (typeof candidate.cognitiveDemand === 'string') {
+              const trimmed = candidate.cognitiveDemand.trim();
+              if (trimmed.length > 0) {
+                candidateCognitiveDemand = trimmed;
+              }
+            } else if (candidate.cognitiveDemand !== undefined && candidate.cognitiveDemand !== null) {
+              candidateCognitiveDemand = String(candidate.cognitiveDemand);
+            }
+
+            if (candidateCognitiveDemand !== undefined && candidateCognitiveDemand !== matchedPlannedItem.cognitiveDemand) {
+              issues.push({
+                code: 'PLANNED_ITEM_COGNITIVE_DEMAND_MISMATCH',
+                severity: 'REVIEW',
+                message: `Kandidat ITEM #${idx + 1} memiliki cognitiveDemand [${candidateCognitiveDemand}] berbeda dengan target plannedItem [${matchedPlannedItem.cognitiveDemand}].`,
+                objectiveRefId: contractUnit.objectiveRefId,
+              });
+              return;
+            }
+
+            let candidateDifficultyTarget: string | undefined = undefined;
+            if (typeof candidate.difficultyTarget === 'string') {
+              const trimmed = candidate.difficultyTarget.trim();
+              if (trimmed.length > 0) {
+                candidateDifficultyTarget = trimmed;
+              }
+            } else if (candidate.difficultyTarget !== undefined && candidate.difficultyTarget !== null) {
+              candidateDifficultyTarget = String(candidate.difficultyTarget);
+            }
+
+            if (candidateDifficultyTarget !== undefined && candidateDifficultyTarget !== matchedPlannedItem.difficultyTarget) {
+              issues.push({
+                code: 'PLANNED_ITEM_DIFFICULTY_TARGET_MISMATCH',
+                severity: 'REVIEW',
+                message: `Kandidat ITEM #${idx + 1} memiliki difficultyTarget [${candidateDifficultyTarget}] berbeda dengan target plannedItem [${matchedPlannedItem.difficultyTarget}].`,
+                objectiveRefId: contractUnit.objectiveRefId,
+              });
+              return;
+            }
+
             fulfilledPlannedItemIds.add(matchedPlannedItem.id);
           }
         }
@@ -1242,6 +1282,16 @@ export function parseAndValidateRawAIResponse(
           plannedItemId: matchedPlannedItem?.id || candidate.plannedItemId,
           sequence: matchedPlannedItem?.sequence || candidate.sequence,
         };
+
+        const canonicalCognitiveDemand = matchedPlannedItem?.cognitiveDemand || contractUnit.cognitiveDemand;
+        if (canonicalCognitiveDemand) {
+          (itemUnit as any).cognitiveDemand = canonicalCognitiveDemand;
+        }
+
+        const canonicalDifficultyTarget = matchedPlannedItem?.difficultyTarget || contractUnit.difficultyTarget;
+        if (canonicalDifficultyTarget) {
+          (itemUnit as any).difficultyTarget = canonicalDifficultyTarget;
+        }
 
         validatedUnits.push(itemUnit);
         generatedCountPerCoverage.set(covId, (generatedCountPerCoverage.get(covId) || 0) + 1);
