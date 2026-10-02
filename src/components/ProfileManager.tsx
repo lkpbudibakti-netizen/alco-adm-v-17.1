@@ -93,6 +93,7 @@ export const ProfileManager: React.FC<ProfileManagerProps> = ({
   const [isEditingProfile, setIsEditingProfile] = useState(false);
   const [profileModalMode, setProfileModalMode] = useState<'create' | 'edit'>('edit');
   const [profileToDelete, setProfileToDelete] = useState<TeacherProfile | null>(null);
+  const [workspaceToDelete, setWorkspaceToDelete] = useState<{ id: string; name: string } | null>(null);
   const [pendingDeleteId, setPendingDeleteId] = useState<string | null>(null);
   const [deleteNotice, setDeleteNotice] = useState<{ type: 'success' | 'error'; message: string } | null>(null);
   const [workspaceNotice, setWorkspaceNotice] = useState<string | null>(null);
@@ -1101,11 +1102,12 @@ export const ProfileManager: React.FC<ProfileManagerProps> = ({
                         id={`btn-delete-workspace-${ws.id}`}
                         onClick={(e) => {
                           e.stopPropagation();
-                          if (confirm(`Hapus administrasi "${displayTitle}"?`)) {
-                            onDeleteWorkspace(ws.id);
-                          }
+                          setWorkspaceToDelete({
+                            id: ws.id,
+                            name: displayTitle,
+                          });
                         }}
-                        className="p-1.5 text-slate-400 hover:text-rose-600 hover:bg-rose-50 rounded-lg transition opacity-0 group-hover:opacity-100 cursor-pointer"
+                        className="p-1.5 text-slate-400 hover:text-rose-600 hover:bg-rose-50 rounded-lg transition cursor-pointer shrink-0"
                         title="Hapus Administrasi"
                       >
                         <Trash2 className="w-4 h-4" />
@@ -1904,6 +1906,55 @@ export const ProfileManager: React.FC<ProfileManagerProps> = ({
                 className="px-4 py-2 text-xs font-semibold text-white bg-rose-600 hover:bg-rose-700 rounded-xl transition shadow-xs cursor-pointer"
               >
                 Hapus Profil
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* MODAL: Konfirmasi Hapus Administrasi Tahunan */}
+      {workspaceToDelete && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/60 backdrop-blur-xs">
+          <div className="bg-white rounded-2xl max-w-md w-full p-6 shadow-2xl border border-slate-200 space-y-4">
+            <div className="flex items-start gap-3">
+              <div className="w-10 h-10 rounded-xl bg-rose-100 text-rose-600 flex items-center justify-center shrink-0">
+                <Trash2 className="w-5 h-5" />
+              </div>
+              <div className="space-y-1.5 flex-1 min-w-0">
+                <h3 className="text-base font-bold text-slate-900">Hapus Administrasi?</h3>
+                <p className="text-xs text-slate-600 leading-relaxed">
+                  Apakah Anda yakin ingin menghapus administrasi tahunan ini?
+                </p>
+                <div className="p-3 rounded-xl bg-slate-50 border border-slate-200 text-xs font-semibold text-slate-800 break-words">
+                  {workspaceToDelete.name}
+                </div>
+                <p className="text-[11px] text-slate-500">
+                  Seluruh data perencanaan kurikulum dan alokasi waktu pada administrasi ini akan dihapus secara permanen.
+                </p>
+              </div>
+            </div>
+            <div className="flex justify-end gap-2 pt-2 border-t border-slate-100">
+              <button
+                id="btn-cancel-delete-workspace"
+                type="button"
+                onClick={() => setWorkspaceToDelete(null)}
+                className="px-4 py-2 text-xs font-semibold text-slate-600 hover:bg-slate-100 rounded-xl transition cursor-pointer"
+              >
+                Batal
+              </button>
+              <button
+                id="btn-confirm-delete-workspace"
+                type="button"
+                onClick={() => {
+                  const target = workspaceToDelete;
+                  setWorkspaceToDelete(null);
+                  if (onDeleteWorkspace && target) {
+                    onDeleteWorkspace(target.id);
+                  }
+                }}
+                className="px-4 py-2 text-xs font-semibold text-white bg-rose-600 hover:bg-rose-700 rounded-xl transition shadow-xs cursor-pointer"
+              >
+                Hapus Administrasi
               </button>
             </div>
           </div>
