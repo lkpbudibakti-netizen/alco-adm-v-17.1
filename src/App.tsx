@@ -691,10 +691,7 @@ export function App() {
     }
 
     try {
-      const canonicalItems = (atp.items || []).map((item) => {
-        const { semester: _legacySemester, ...annualItem } = item;
-        return annualItem;
-      });
+      const canonicalItems = (atp.items || []).map((item) => ({ ...item }));
 
       const canonicalATP: ATPData = {
         ...atp,
