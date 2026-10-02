@@ -195,7 +195,7 @@ export function performImportProjectTransferInState(
     academicSettingId: newYearPlanId,
     generalDescription: cpGeneralDescription,
     elements: cpElements,
-    workflowStatus: cpElements.length > 0 ? 'SIAP' : 'DRAFT',
+    workflowStatus: 'DRAFT',
     lastEditedAt: now,
     updatedAt: now,
   };
@@ -219,7 +219,7 @@ export function performImportProjectTransferInState(
       contentScope: (t.materialScope || '').trim(),
       order: idx + 1,
       sequence: idx + 1,
-      status: 'FINAL',
+      status: 'DRAFT',
       provenance: {
         generatedBy: 'USER',
         generatedAt: now,
@@ -240,8 +240,8 @@ export function performImportProjectTransferInState(
     academicYear: targetAcademicYear,
     ...(pkg.phase ? { phase: pkg.phase.trim() } : {}),
     items: tpItems,
-    status: 'FINAL',
-    workflowStatus: tpItems.length > 0 ? 'SIAP' : 'DRAFT',
+    status: 'DRAFT',
+    workflowStatus: 'DRAFT',
     provenance: {
       generatedBy: 'USER',
       generatedAt: now,
@@ -287,7 +287,6 @@ export function performImportProjectTransferInState(
       materialScope: (a.material || matchedTPItem.contentScope || '').trim(),
       allocatedJP: jpVal,
       jp: jpVal,
-      ...(a.semester === 1 || a.semester === 2 ? { semester: a.semester } : {}),
       provenance: {
         generatedBy: 'USER',
         generatedAt: now,
@@ -309,8 +308,8 @@ export function performImportProjectTransferInState(
     knownTotalJP,
     hasUnknownJP,
     allocationComplete: false,
-    status: 'FINAL',
-    workflowStatus: atpItems.length > 0 ? 'SIAP' : 'DRAFT',
+    status: 'DRAFT',
+    workflowStatus: 'DRAFT',
     provenance: {
       generatedBy: 'USER',
       generatedAt: now,
