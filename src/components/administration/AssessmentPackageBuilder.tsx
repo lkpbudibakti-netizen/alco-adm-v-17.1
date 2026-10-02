@@ -3554,7 +3554,7 @@ export const AssessmentPackageBuilder: React.FC<AssessmentPackageBuilderProps> =
             {/* TAB 5: PREVIEW */}
             {activeTab === 'preview' && (
               <div className="space-y-6">
-                {activePackage.workflowStatus !== 'SIAP' && (
+                {activePackage.workflowStatus === 'DRAFT' && (
                   <div className="p-4 rounded-xl border bg-blue-50 border-blue-200 text-blue-900 flex flex-col sm:flex-row sm:items-center justify-between gap-4">
                     <div className="flex items-start gap-2.5">
                       <Info className="w-5 h-5 text-blue-600 flex-shrink-0 mt-0.5" />
@@ -3639,22 +3639,6 @@ export const AssessmentPackageBuilder: React.FC<AssessmentPackageBuilderProps> =
                     );
                   }
                 })()}
-
-                {activePackage.workflowStatus !== 'SIAP' && (
-                  <div className="p-4 rounded-xl border bg-slate-50 border-slate-200 flex flex-col sm:flex-row sm:items-center justify-between gap-4">
-                    <p className="text-xs text-slate-600">
-                      Perangkat masih DRAFT. Lakukan validasi dan konfirmasi untuk menandai perangkat SIAP.
-                    </p>
-                    <button
-                      type="button"
-                      onClick={() => setActiveTab('validation')}
-                      className="px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-lg text-xs font-bold flex items-center justify-center gap-1.5 shadow whitespace-nowrap self-start sm:self-auto transition"
-                    >
-                      <CheckCircle2 className="w-4 h-4" />
-                      Lanjut ke Validasi & Konfirmasi
-                    </button>
-                  </div>
-                )}
               </div>
             )}
 
