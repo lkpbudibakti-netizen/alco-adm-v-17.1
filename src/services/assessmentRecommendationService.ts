@@ -8,6 +8,7 @@ import {
   CognitiveDemand,
   AssessmentDifficultyTarget,
 } from '../types';
+import { resolveGrade } from './assessmentGenerationProfileService';
 
 export type GradeBracket =
   | 'SD_EARLY'   // Kelas 1-2 / Fase A
@@ -82,6 +83,15 @@ export const DIFFICULTY_LABELS: Record<AssessmentDifficultyTarget, string> = {
  */
 export function resolveGradeBracket(setting?: AcademicSetting): GradeBracket | undefined {
   if (!setting) return undefined;
+
+  const gradeNum = resolveGrade(setting);
+  if (gradeNum !== undefined) {
+    if (gradeNum === 1 || gradeNum === 2) return 'SD_EARLY';
+    if (gradeNum === 3 || gradeNum === 4) return 'SD_MIDDLE';
+    if (gradeNum === 5 || gradeNum === 6) return 'SD_UPPER';
+    if (gradeNum >= 7 && gradeNum <= 9) return 'SMP';
+    if (gradeNum >= 10 && gradeNum <= 12) return 'SMA_SMK';
+  }
 
   const level = (setting.level || '').toUpperCase();
   const gradeStr = String(setting.grade || '').trim();
