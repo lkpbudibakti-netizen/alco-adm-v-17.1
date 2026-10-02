@@ -998,7 +998,11 @@ export function App() {
     }
 
     try {
-      const existing = runtimeContext.semesterData?.learningPlan || [];
+      const state = loadStorageV5();
+      const currentEntry = state.semesterData.learningPlan.find(
+        (e) => e.semesterPlanId === activeSemesterPlan.id
+      )?.value;
+      const existing = currentEntry || [];
       const planWithTimestamp = {
         ...plan,
         updatedAt: new Date().toISOString(),
@@ -1014,6 +1018,39 @@ export function App() {
       setAppNotice({
         type: 'error',
         message: err instanceof Error ? err.message : 'Gagal menyimpan modul ajar.',
+      });
+    }
+  };
+
+  const handleSaveBulkLearningPlans = (plansToSave: LearningPlan[]) => {
+    if (!activeSemesterPlan || plansToSave.length === 0) return;
+
+    try {
+      const state = loadStorageV5();
+      const currentEntry = state.semesterData.learningPlan.find(
+        (e) => e.semesterPlanId === activeSemesterPlan.id
+      )?.value;
+      const existing = currentEntry || [];
+      const now = new Date().toISOString();
+
+      const planMap = new Map<string, LearningPlan>();
+      for (const p of existing) {
+        planMap.set(p.id, p);
+      }
+      for (const p of plansToSave) {
+        planMap.set(p.id, {
+          ...p,
+          updatedAt: p.updatedAt || now,
+        });
+      }
+
+      const nextPlans = Array.from(planMap.values());
+      saveLearningPlansV5(activeSemesterPlan.id, nextPlans);
+      refreshV5();
+    } catch (err: any) {
+      setAppNotice({
+        type: 'error',
+        message: err instanceof Error ? err.message : 'Gagal menyimpan draf modul ajar.',
       });
     }
   };
@@ -1419,6 +1456,7 @@ export function App() {
               onSaveK13Analysis={handleSaveK13Analysis}
               onSaveK13KKM={handleSaveK13KKM}
               onSaveLearningPlan={handleSaveLearningPlan}
+              onSaveBulkLearningPlans={handleSaveBulkLearningPlans}
               onDeleteLearningPlan={handleDeleteLearningPlan}
               onBackToStep={(step) => setCurrentStep(step)}
               onUpdateDocuments={(updatedDocs) => {}}

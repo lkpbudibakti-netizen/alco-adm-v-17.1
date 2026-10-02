@@ -89,6 +89,7 @@ interface LearningPlanManagerProps {
   assessmentCriteria?: AssessmentCriterion[];
   learningPlans: LearningPlan[];
   onSavePlan: (plan: LearningPlan) => void;
+  onSaveBulkPlans?: (plans: LearningPlan[]) => void;
   onDeletePlan: (planId: string) => void;
 }
 
@@ -104,6 +105,7 @@ export const LearningPlanManager: React.FC<LearningPlanManagerProps> = ({
   assessmentCriteria = [],
   learningPlans = [],
   onSavePlan,
+  onSaveBulkPlans,
   onDeletePlan,
 }) => {
   const [selectedPlanId, setSelectedPlanId] = useState<string | null>(() => {
@@ -442,13 +444,17 @@ export const LearningPlanManager: React.FC<LearningPlanManagerProps> = ({
 
     showNotification('info', `Memulai penyiapan ${total} draft Modul Ajar (0 / ${total} draft selesai)...`);
 
+    const generatedPlans: LearningPlan[] = [];
     let processed = 0;
     for (const scope of pendingScopes) {
       try {
         const draftPlan = await generateAIDraftPlanForScope(scope);
-        onSavePlan(draftPlan);
+        generatedPlans.push(draftPlan);
         successCount++;
         lastGeneratedPlanId = draftPlan.id;
+        if (onSaveBulkPlans) {
+          onSaveBulkPlans([...generatedPlans]);
+        }
       } catch (err: any) {
         console.error(`Gagal menyusun draft untuk unit '${scope.title}':`, err);
         failCount++;
@@ -456,6 +462,12 @@ export const LearningPlanManager: React.FC<LearningPlanManagerProps> = ({
       processed++;
       setBulkProgress({ current: processed, total });
       showNotification('info', `${processed} / ${total} draft selesai`);
+    }
+
+    if (onSaveBulkPlans && generatedPlans.length > 0) {
+      onSaveBulkPlans(generatedPlans);
+    } else if (!onSaveBulkPlans && generatedPlans.length > 0) {
+      generatedPlans.forEach((p) => onSavePlan(p));
     }
 
     setIsBulkGenerating(false);
