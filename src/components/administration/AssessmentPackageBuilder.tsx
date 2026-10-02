@@ -175,6 +175,38 @@ export const AssessmentPackageBuilder: React.FC<AssessmentPackageBuilderProps> =
     confirmationEligible,
   });
 
+  const generationBlockedMessages = (() => {
+    if (uiState !== 'GENERATION_BLOCKED') return [];
+
+    const spec = resolveAssessmentGenerationSpec({
+      assessmentPlan: selectedPlan,
+      academicSetting,
+      tp,
+      k13Analysis,
+      assessmentCriteria,
+    });
+    const genPlan = resolveAssessmentGenerationPlan({
+      generationSpec: spec,
+    });
+
+    const specBlockingIssues = (spec.resolution?.issues || []).filter(
+      (issue) => issue.severity === 'BLOCKING'
+    );
+    const planBlockingIssues = (genPlan.resolution?.issues || []).filter(
+      (issue) =>
+        issue.severity === 'BLOCKING' &&
+        !(specBlockingIssues.length > 0 && issue.code === 'UPSTREAM_SPEC_BLOCKED')
+    );
+
+    return Array.from(
+      new Set(
+        [...specBlockingIssues, ...planBlockingIssues]
+          .map((issue) => issue.message?.trim())
+          .filter((message): message is string => Boolean(message))
+      )
+    );
+  })();
+
   // Synchronize active instrument tab
   useEffect(() => {
     if (selectedPlan && selectedPlan.instruments.length > 0) {
@@ -828,11 +860,27 @@ export const AssessmentPackageBuilder: React.FC<AssessmentPackageBuilderProps> =
           </p>
         </div>
       ) : uiState === 'GENERATION_BLOCKED' ? (
-        <div className="bg-red-50 border border-red-200 text-red-800 p-6 rounded-xl text-center max-w-xl mx-auto shadow-sm">
-          <AlertOctagon className="w-12 h-12 text-red-600 mx-auto mb-3" />
-          <h4 className="text-lg font-bold mb-2">Generasi AI Diblokir</h4>
-          <p className="text-sm text-red-700">
-            Beberapa kelengkapan data kurikulum atau kriteria asesmen belum dikonfigurasi secara lengkap untuk rencana ini. Silakan lengkapi data TP/KD atau kriteria di tab sebelumnya.
+        <div className="bg-red-50 border border-red-200 text-red-800 p-6 rounded-xl max-w-xl mx-auto shadow-sm">
+          <div className="text-center">
+            <AlertOctagon className="w-12 h-12 text-red-600 mx-auto mb-3" />
+            <h4 className="text-lg font-bold mb-2">Generasi AI Diblokir</h4>
+            <p className="text-sm text-red-700">Perangkat belum dapat dibuat karena:</p>
+          </div>
+
+          {generationBlockedMessages.length > 0 ? (
+            <ul className="mt-4 space-y-2 text-sm text-red-800 text-left list-disc pl-5">
+              {generationBlockedMessages.map((message) => (
+                <li key={message}>{message}</li>
+              ))}
+            </ul>
+          ) : (
+            <p className="mt-4 text-sm text-red-800 text-left">
+              Data prasyarat generasi belum lengkap atau belum berstatus SIAP.
+            </p>
+          )}
+
+          <p className="mt-4 text-sm text-red-700 text-center">
+            Silakan perbaiki data yang disebutkan di atas.
           </p>
         </div>
       ) : uiState === 'READY_TO_GENERATE' ? (
