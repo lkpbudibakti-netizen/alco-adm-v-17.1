@@ -411,7 +411,27 @@ export function buildGenerationContract(
   const objMap = new Map((spec.objectives || []).map((o) => [o.id, o]));
   const critMap = new Map((spec.criteria || []).map((c) => [c.id, c]));
 
-  const units: AssessmentGenerationContractUnit[] = plan.coverageUnits.map((cov) => {
+  const hasPlannedItems = Array.isArray(plan.plannedItems) && plan.plannedItems.length > 0;
+  const plannedCoverageUnitCounts = new Map<string, number>();
+  if (hasPlannedItems) {
+    plan.plannedItems!.forEach((pi) => {
+      plannedCoverageUnitCounts.set(
+        pi.coverageUnitId,
+        (plannedCoverageUnitCounts.get(pi.coverageUnitId) || 0) + 1
+      );
+    });
+  }
+
+  const units: AssessmentGenerationContractUnit[] = [];
+
+  for (const cov of plan.coverageUnits) {
+    if (cov.allocationUnit === 'ITEM' && hasPlannedItems) {
+      const allocatedCount = plannedCoverageUnitCounts.get(cov.id) || 0;
+      if (allocatedCount === 0) {
+        continue;
+      }
+    }
+
     const obj = objMap.get(cov.objectiveRefId);
     const crit = cov.criterionId ? critMap.get(cov.criterionId) : undefined;
 
@@ -440,7 +460,12 @@ export function buildGenerationContract(
       ? ((cov as any).materialSource || 'TEACHER')
       : undefined;
 
-    return {
+    const requiredCount =
+      cov.allocationUnit === 'ITEM' && hasPlannedItems
+        ? (plannedCoverageUnitCounts.get(cov.id) || 1)
+        : (cov.recommendedCount || 1);
+
+    units.push({
       coverageUnitId: cov.id,
       objectiveRefId: cov.objectiveRefId,
       criterionId: cov.criterionId,
@@ -448,7 +473,7 @@ export function buildGenerationContract(
       criterionText,
       instrumentType: cov.instrumentType!,
       allocationUnit: cov.allocationUnit!,
-      requiredCount: cov.recommendedCount || 1,
+      requiredCount,
       cognitiveDemand: cov.cognitiveDemand,
       stimulusType: cov.stimulusType,
       difficultyTarget: cov.difficultyTarget,
@@ -456,8 +481,8 @@ export function buildGenerationContract(
       materialOrContext,
       indicatorSource,
       materialSource,
-    };
-  });
+    });
+  }
 
   return {
     assessmentPlanId: spec.assessmentPlanId,
