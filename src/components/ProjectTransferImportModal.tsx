@@ -240,7 +240,7 @@ export const ProjectTransferImportModal: React.FC<ProjectTransferImportModalProp
               <input
                 ref={fileInputRef}
                 type="file"
-                accept=".xlsx,.xls"
+                accept=".xlsx"
                 onChange={handleFileChange}
                 className="hidden"
               />
