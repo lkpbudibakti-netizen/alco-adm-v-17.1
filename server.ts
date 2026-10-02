@@ -1016,7 +1016,7 @@ function validateAILearningPlanPayload(data: any): { isValid: boolean; reason?: 
 // Endpoint: AI Generate Learning Plan (Modul Ajar DRAFT)
 app.post('/api/ai/generate-learning-plan', async (req, res) => {
   const requestId = `req-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
-  const { academicSetting, tps, atpItems, topic } = req.body || {};
+  const { academicSetting, tps, atpItems, topic, allocatedJP } = req.body || {};
 
   if (!tps || !Array.isArray(tps) || tps.length === 0) {
     return res.status(400).json({ error: 'Minimal satu Tujuan Pembelajaran (TP) diperlukan untuk menyusun Modul Ajar' });
@@ -1037,6 +1037,11 @@ app.post('/api/ai/generate-learning-plan', async (req, res) => {
     const grade = academicSetting?.grade || '';
     const phase = academicSetting?.phase || '';
 
+    const canonicalAllocatedJP =
+      typeof allocatedJP === 'number' && Number.isFinite(allocatedJP) && allocatedJP > 0
+        ? allocatedJP
+        : undefined;
+
     const atpContextStr = atpItems && atpItems.length > 0
       ? atpItems.map((a: any, i: number) => {
           const actualJp = typeof a.allocatedJP === 'number' && a.allocatedJP > 0
@@ -1053,6 +1058,7 @@ Susun draf Modul Ajar pedagogis yang komprehensif berdasarkan data rujukan berik
 MATA PELAJARAN: ${subject}
 KELAS / FASE: ${grade} / ${phase}
 TOPIK: ${topic || tps[0]?.contentScope || tps[0]?.statement || 'Topik Pembelajaran'}
+ALOKASI WAKTU KANONIKAL: ${canonicalAllocatedJP ? `${canonicalAllocatedJP} JP` : 'Belum ditentukan'}
 
 TUJUAN PEMBELAJARAN (TP) RUJUKAN:
 ${tps.map((t: any, i: number) => `${i + 1}. [Kode: ${t.code || '-'}] ${t.statement} (Materi: ${t.contentScope || '-'}, Kompetensi: ${t.competence || '-'})`).join('\n')}
@@ -1073,7 +1079,11 @@ INSTRUKSI KEGIATAN & ASESMEN:
 8. Sediakan Rencana Asesmen (Asesmen Diagnostik Awal, Formatif, dan Sumatif).
 9. Sediakan Rencana Diferensiasi (Konten, Proses, Produk).
 10. Buat kalimat pemahaman bermakna dan pertanyaan pemantik yang relevan.
-11. JANGAN mengarang atau memalsukan Alokasi JP jika belum ditentukan.
+${
+  canonicalAllocatedJP
+    ? `11. ALOKASI WAKTU KANONIKAL: Unit pembelajaran ini memiliki Alokasi Waktu tepat ${canonicalAllocatedJP} JP dari pemetaan waktu semester. Rancang seluruh rangkaian kegiatan dan pengalaman belajar secara proporsional sesuai durasi ${canonicalAllocatedJP} JP tersebut. Jangan menebak, mengubah, atau menyimpulkan angka JP yang berbeda.`
+    : `11. ALOKASI WAKTU: Belum ditentukan. JANGAN mengarang atau memalsukan Alokasi JP.`
+}
 
 Kembalikan output JSON sesuai schema.`;
 
@@ -1236,6 +1246,10 @@ Kembalikan output JSON sesuai schema.`;
     if (!validation.isValid) {
       console.warn(`[AI Service][learning-plan][${requestId}] Gemini output invalid:`, validation.reason);
       return res.status(500).json({ error: `Respons AI tidak memenuhi kualifikasi struktur Modul Ajar: ${validation.reason}` });
+    }
+
+    if (canonicalAllocatedJP) {
+      parsed.allocatedJP = canonicalAllocatedJP;
     }
 
     return res.json({ success: true, data: parsed, engine: 'gemini' });

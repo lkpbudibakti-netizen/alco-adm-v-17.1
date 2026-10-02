@@ -312,27 +312,56 @@ export const LearningPlanManager: React.FC<LearningPlanManagerProps> = ({
     }
   };
 
+  const [isBulkGenerating, setIsBulkGenerating] = useState(false);
+  const [bulkProgress, setBulkProgress] = useState<{ current: number; total: number } | null>(null);
+
+  const hasAssociatedPlan = (scope: LearningPlanScopeUnit, plans: LearningPlan[]): boolean => {
+    return plans.some((p) => {
+      if (scope.type === 'ATP_STEP' && scope.atpItem?.id) {
+        if (p.atpItemIds && p.atpItemIds.includes(scope.atpItem.id)) {
+          return true;
+        }
+        if ((!p.atpItemIds || p.atpItemIds.length === 0) && p.tpIds && p.tpIds.includes(scope.tpItem.id)) {
+          return true;
+        }
+      } else if (scope.tpItem?.id) {
+        if (p.tpIds && p.tpIds.includes(scope.tpItem.id)) {
+          return true;
+        }
+      }
+      return false;
+    });
+  };
+
+  const generateAIDraftPlanForScope = async (scope: LearningPlanScopeUnit): Promise<LearningPlan> => {
+    const aiDraftResult = await generateLearningPlanWithAI({
+      academicSetting,
+      tps: [scope.tpItem],
+      atpItems: scope.atpItem ? [scope.atpItem] : [],
+      topic: scope.materialScope || scope.tpItem.contentScope || scope.tpItem.statement,
+      allocatedJP: scope.jp,
+    });
+
+    const draftPlan = createAIDraftLearningPlan({
+      academicSetting,
+      curriculumType,
+      tpIds: scope.linkedTpIds,
+      atpItemIds: scope.linkedAtpItemIds,
+      allocatedJP: scope.jp,
+      aiDraft: aiDraftResult,
+      context: { tp, atp },
+    });
+
+    return draftPlan;
+  };
+
   const executeAIGenerationForScope = async (scope: LearningPlanScopeUnit) => {
     setIsScopeModalOpen(false);
     setIsGeneratingAI(true);
     showNotification('info', `Sedang menyusun Draf AI Modul Ajar untuk unit '${scope.title}'...`);
 
     try {
-      const aiDraftResult = await generateLearningPlanWithAI({
-        academicSetting,
-        tps: [scope.tpItem],
-        atpItems: scope.atpItem ? [scope.atpItem] : [],
-        topic: scope.materialScope || scope.tpItem.contentScope || scope.tpItem.statement,
-      });
-
-      const draftPlan = createAIDraftLearningPlan({
-        academicSetting,
-        curriculumType,
-        tpIds: scope.linkedTpIds,
-        atpItemIds: scope.linkedAtpItemIds,
-        aiDraft: aiDraftResult,
-        context: { tp, atp },
-      });
+      const draftPlan = await generateAIDraftPlanForScope(scope);
 
       onSavePlan(draftPlan);
       setSelectedPlanId(draftPlan.id);
@@ -346,6 +375,102 @@ export const LearningPlanManager: React.FC<LearningPlanManagerProps> = ({
       showNotification('error', `Draf AI tidak dibuat. Rancangan yang sedang terlihat adalah rancangan sebelumnya. ${err.message || 'Terjadi kesalahan'}`);
     } finally {
       setIsGeneratingAI(false);
+    }
+  };
+
+  const handleBulkCreateAIDrafts = async () => {
+    if (curriculumType === 'K13') {
+      recordLearningPlanBlocked('CURRICULUM_UNRESOLVED');
+      showNotification('error', 'Penyusunan RPP K13 pada modul Perencanaan Pembelajaran ini belum didukung. Gunakan administrasi K13 yang tersedia sampai workflow K13 khusus disiapkan.');
+      return;
+    }
+    if (curriculumType !== 'KURIKULUM_MERDEKA') {
+      recordLearningPlanBlocked('CURRICULUM_UNRESOLVED');
+      showNotification('error', 'Kurikulum belum terselesaikan. Draf AI tidak dibuat agar tidak diarahkan diam-diam ke Kurikulum Merdeka.');
+      return;
+    }
+    if (!tp || tp.workflowStatus !== 'SIAP') {
+      recordLearningPlanBlocked('TP_STATUS_NOT_READY');
+      showNotification('error', `TP belum siap untuk AI (${tp?.workflowStatus || 'BELUM_DIMULAI'}). Tinjau TP terlebih dahulu.`);
+      return;
+    }
+    if (tp?.needsReview) {
+      recordLearningPlanBlocked('TP_NEEDS_REVIEW');
+      showNotification('error', `TP perlu ditinjau sebelum AI draft: ${tp.reviewReason || 'status needsReview aktif'}.`);
+      return;
+    }
+    if (atp?.needsReview) {
+      recordLearningPlanBlocked('ATP_NEEDS_REVIEW');
+      showNotification('error', `ATP perlu ditinjau sebelum AI draft: ${atp.reviewReason || 'status needsReview aktif'}.`);
+      return;
+    }
+    if (atp?.items?.length && !isAtpReadyForAIScope(atp)) {
+      recordLearningPlanBlocked('ATP_STATUS_NOT_READY');
+      showNotification('error', 'ATP belum siap untuk digunakan sebagai sumber Draf AI. Tinjau dan selesaikan ATP terlebih dahulu.');
+      return;
+    }
+
+    if (semesterScopes.length === 0) {
+      recordLearningPlanBlocked('NO_VALID_SCOPE');
+      showNotification('error', 'Belum ada TP/ATP yang dialokasikan pada semester aktif. Selesaikan Pemetaan Waktu terlebih dahulu.');
+      return;
+    }
+
+    // Select only active semester scopes that do not yet have an associated LearningPlan
+    const pendingScopes: LearningPlanScopeUnit[] = [];
+    let skippedCount = 0;
+
+    for (const scope of semesterScopes) {
+      if (hasAssociatedPlan(scope, learningPlans)) {
+        skippedCount++;
+      } else {
+        pendingScopes.push(scope);
+      }
+    }
+
+    if (pendingScopes.length === 0) {
+      showNotification('info', `Semua unit pembelajaran semester aktif (${skippedCount}) sudah memiliki rancangan modul ajar.`);
+      return;
+    }
+
+    setIsGeneratingAI(true);
+    setIsBulkGenerating(true);
+    const total = pendingScopes.length;
+    let successCount = 0;
+    let failCount = 0;
+    let lastGeneratedPlanId: string | null = null;
+
+    showNotification('info', `Memulai penyiapan ${total} draft Modul Ajar (0 / ${total} draft selesai)...`);
+
+    let processed = 0;
+    for (const scope of pendingScopes) {
+      try {
+        const draftPlan = await generateAIDraftPlanForScope(scope);
+        onSavePlan(draftPlan);
+        successCount++;
+        lastGeneratedPlanId = draftPlan.id;
+      } catch (err: any) {
+        console.error(`Gagal menyusun draft untuk unit '${scope.title}':`, err);
+        failCount++;
+      }
+      processed++;
+      setBulkProgress({ current: processed, total });
+      showNotification('info', `${processed} / ${total} draft selesai`);
+    }
+
+    setIsBulkGenerating(false);
+    setIsGeneratingAI(false);
+    setBulkProgress(null);
+
+    if (lastGeneratedPlanId) {
+      setSelectedPlanId(lastGeneratedPlanId);
+    }
+
+    const summaryText = `Penyusunan draft selesai: ${successCount} berhasil, ${failCount} gagal, ${skippedCount} dilewati (sudah ada).`;
+    if (failCount === 0) {
+      showNotification('success', summaryText);
+    } else {
+      showNotification('info', summaryText);
     }
   };
 
@@ -525,10 +650,30 @@ export const LearningPlanManager: React.FC<LearningPlanManagerProps> = ({
             </button>
             <button
               onClick={handleCreateNewManual}
-              className="inline-flex items-center gap-1.5 px-3.5 py-2 text-sm font-medium text-slate-700 bg-slate-100 hover:bg-slate-200 rounded-lg transition-colors"
+              className="inline-flex items-center gap-1.5 px-3.5 py-2 text-sm font-medium text-slate-700 bg-slate-100 hover:bg-slate-200 rounded-lg transition-colors cursor-pointer"
             >
               <Plus className="w-4 h-4" />
               Buat Manual
+            </button>
+            <button
+              id="btn-bulk-create-ai-draft"
+              type="button"
+              onClick={handleBulkCreateAIDrafts}
+              disabled={isGeneratingAI}
+              className="inline-flex items-center gap-1.5 px-3.5 py-2 text-sm font-medium text-blue-700 bg-blue-50 hover:bg-blue-100 rounded-lg border border-blue-200 shadow-xs transition-colors disabled:opacity-50 cursor-pointer"
+              title="Siapkan draf AI sekaligus untuk seluruh unit semester aktif yang belum memiliki modul ajar"
+            >
+              {isBulkGenerating && bulkProgress ? (
+                <>
+                  <div className="w-4 h-4 border-2 border-blue-600/40 border-t-blue-600 rounded-full animate-spin" />
+                  <span>{bulkProgress.current} / {bulkProgress.total} draft selesai</span>
+                </>
+              ) : (
+                <>
+                  <Layers className="w-4 h-4 text-blue-600" />
+                  <span>Siapkan Semua Draft</span>
+                </>
+              )}
             </button>
             <button
               onClick={handleCreateAIDraftClick}

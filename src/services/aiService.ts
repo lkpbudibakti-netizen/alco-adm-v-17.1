@@ -310,6 +310,7 @@ export interface GenerateLearningPlanParams {
   tps: TPItem[];
   atpItems?: ATPItem[];
   topic?: string;
+  allocatedJP?: number;
 }
 
 export async function generateLearningPlanWithAI(params: GenerateLearningPlanParams): Promise<Partial<LearningPlan>> {
@@ -394,7 +395,11 @@ export async function generateLearningPlanWithAI(params: GenerateLearningPlanPar
     data.data.assessmentPlan = normalizedAssessmentPlan;
     data.data.reflection = normalizeAIReflection(data.data.reflection);
     data.data.deepLearningContext = normalizeDeepLearningContext(data.data.deepLearningContext);
-    delete data.data.allocatedJP;
+    if (typeof params.allocatedJP === 'number' && params.allocatedJP > 0) {
+      data.data.allocatedJP = params.allocatedJP;
+    } else {
+      delete data.data.allocatedJP;
+    }
 
     return data.data;
   } catch (err) {

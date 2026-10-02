@@ -999,11 +999,19 @@ export function createAIDraftLearningPlan(params: {
   curriculumType?: CurriculumType;
   tpIds: string[];
   atpItemIds?: string[];
+  allocatedJP?: number;
   aiDraft: Partial<LearningPlan>;
   context?: { tp?: TPData | null; atp?: ATPData | null };
 }): LearningPlan {
-  const { academicSetting, curriculumType, tpIds, atpItemIds = [], aiDraft, context } = params;
+  const { academicSetting, curriculumType, tpIds, atpItemIds = [], allocatedJP, aiDraft, context } = params;
   const now = new Date().toISOString();
+
+  const canonicalAllocatedJP =
+    typeof allocatedJP === 'number' && allocatedJP > 0
+      ? allocatedJP
+      : typeof aiDraft.allocatedJP === 'number' && aiDraft.allocatedJP > 0
+      ? aiDraft.allocatedJP
+      : undefined;
 
   const objectives = resolveLearningPlanObjectives({ tpIds, tp: context?.tp, curriculumType }).objectives;
   const normalizedAssessmentPlan = normalizeAIAssessmentPlan(aiDraft.assessmentPlan, tpIds);
@@ -1062,7 +1070,7 @@ export function createAIDraftLearningPlan(params: {
     targetStudents: aiDraft.targetStudents,
     learningModel: aiDraft.learningModel,
     p3Dimensions: aiDraft.p3Dimensions,
-    allocatedJP: undefined,
+    allocatedJP: canonicalAllocatedJP,
     createdAt: now,
     updatedAt: now,
   };
