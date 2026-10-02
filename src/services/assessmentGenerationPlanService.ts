@@ -554,12 +554,10 @@ export function resolveAssessmentGenerationPlan(
       planIssues.push({
         code: 'TEACHER_ITEM_COUNT_UNDER_COVERAGE',
         severity: 'REVIEW',
-        message: `Jumlah butir yang diminta (${N}) lebih kecil dari jumlah cakupan minimal butir (${minItemCoverageCount}). Jumlah permintaan guru dipertahankan tanpa penaikan otomatis.`,
+        message: `Jumlah butir yang diminta (${N}) lebih kecil dari jumlah cakupan semantik ITEM (${minItemCoverageCount}). Jumlah permintaan guru dipertahankan; sebagian target cakupan semantik belum mendapat plannedItem.`,
       });
-      // Allocate 1 to first N units deterministically sorted by ID, 0 to remaining
-      const sorted = [...itemUnits].sort((a, b) => a.id.localeCompare(b.id));
-      sorted.forEach((u, idx) => {
-        u.recommendedCount = idx < N ? 1 : 0;
+      itemUnits.forEach((u) => {
+        u.recommendedCount = 1;
       });
     } else {
       if (N > minItemCoverageCount) {
@@ -633,12 +631,18 @@ export function resolveAssessmentGenerationPlan(
   if (itemUnits.length > 0 && N_total >= 0) {
     const plannedCoverageUnitIds: string[] = [];
     const sortedItemUnits = [...itemUnits].sort((a, b) => a.id.localeCompare(b.id));
-    sortedItemUnits.forEach((u) => {
-      const count = u.recommendedCount !== undefined ? u.recommendedCount : 1;
-      for (let i = 0; i < count; i++) {
-        plannedCoverageUnitIds.push(u.id);
+    if (isRequestedTotalItemsValid && N_total < sortedItemUnits.length) {
+      for (let i = 0; i < N_total; i++) {
+        plannedCoverageUnitIds.push(sortedItemUnits[i].id);
       }
-    });
+    } else {
+      sortedItemUnits.forEach((u) => {
+        const count = u.recommendedCount !== undefined ? u.recommendedCount : 1;
+        for (let i = 0; i < count; i++) {
+          plannedCoverageUnitIds.push(u.id);
+        }
+      });
+    }
 
     // Pad or trim to match exactly N_total
     while (plannedCoverageUnitIds.length < N_total) {
@@ -764,7 +768,7 @@ export function resolveAssessmentGenerationPlan(
   for (const u of coverageUnits) {
     switch (u.allocationUnit) {
       case 'ITEM':
-        itemCount += u.recommendedCount ?? 1;
+        itemCount += plannedItems.length > 0 ? 0 : (u.recommendedCount ?? 1);
         break;
       case 'TASK':
         taskCount += u.recommendedCount ?? 1;
@@ -779,6 +783,9 @@ export function resolveAssessmentGenerationPlan(
         unresolvedCount += 1;
         break;
     }
+  }
+  if (plannedItems.length > 0) {
+    itemCount = plannedItems.length;
   }
 
   // 6. Evaluasi Status Final Plan

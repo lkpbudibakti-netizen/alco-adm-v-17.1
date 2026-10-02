@@ -36,9 +36,25 @@ export function validateAssessmentCoverage(
   }
 
   const planUnitsMap = new Map(generationPlan.coverageUnits.map((u) => [u.id, u]));
+  const plannedItemCoverageCounts = new Map<string, number>();
+  (generationPlan.plannedItems || []).forEach((plannedItem) => {
+    plannedItemCoverageCounts.set(
+      plannedItem.coverageUnitId,
+      (plannedItemCoverageCounts.get(plannedItem.coverageUnitId) || 0) + 1
+    );
+  });
 
   // 1. Check each planned coverage unit against package using CANONICAL coverageUnitId ONLY (BLOCKER 3)
   for (const planUnit of generationPlan.coverageUnits) {
+    const isUnallocatedSemanticItemUnit =
+      planUnit.allocationUnit === 'ITEM' &&
+      plannedItemCoverageCounts.size > 0 &&
+      !plannedItemCoverageCounts.has(planUnit.id);
+
+    if (isUnallocatedSemanticItemUnit) {
+      continue;
+    }
+
     // Exact coverageUnitId match ONLY. No fallback to objectiveRefId/criterionId!
     const matchingBpItems = pkg.blueprintItems.filter((bp) => bp.coverageUnitId === planUnit.id);
 
@@ -161,7 +177,10 @@ export function validateAssessmentCoverage(
 
     // FIX 2: Check planned count vs actual count ONLY if recommendedCount is defined
     if (planUnit.recommendedCount !== undefined) {
-      const expectedCount = planUnit.recommendedCount;
+      const expectedCount =
+        planUnit.allocationUnit === 'ITEM' && plannedItemCoverageCounts.has(planUnit.id)
+          ? plannedItemCoverageCounts.get(planUnit.id)!
+          : planUnit.recommendedCount;
       let actualCount = 0;
       let isUnresolved = false;
       let hasDeterministicLinkage = false;

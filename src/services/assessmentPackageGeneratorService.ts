@@ -495,7 +495,7 @@ ATURAN GENERASI KETAT:
    - JANGAN mengubah jumlah butir/tugas (requiredCount). Hasilkan PERSIS sesuai requiredCount.
    - JANGAN mengklaim konten sintetis buatan AI sebagai dokumen resmi (OFFICIAL) atau regulasi pemerintah.
    - JANGAN menandai draf sebagai SIAP atau FINAL (seluruh keluaran adalah DRAFT).
-   - UNTUK TES TERTULIS (WRITTEN_TEST): Rencana butir soal (plannedItems) bersifat AUTHORITATIVE. Setiap plannedItem menentukan TEPAT: sequence, coverageUnitId, itemType, cognitiveDemand, dan difficultyTarget. AI DILARANG menentukan ulang atau mengacak distribusi bentuk soal / kognitif / kesulitan. AI WAJIB menghasilkan 1 item untuk setiap plannedItem persis sesuai targetnya.
+   - UNTUK TES TERTULIS (WRITTEN_TEST): Rencana butir soal (plannedItems) bersifat AUTHORITATIVE. Setiap plannedItem menentukan TEPAT: sequence, coverageUnitId, itemType, cognitiveDemand, dan difficultyTarget. AI DILARANG menentukan ulang atau mengacak distribusi bentuk soal / kognitif / kesulitan. AI WAJIB menghasilkan 1 item untuk setiap plannedItem persis sesuai targetnya. Coverage unit ITEM tanpa plannedItem adalah target cakupan semantik, BUKAN perintah membuat butir fisik.
 
 2. SEMANTIK ALOKASI & KONTRAK FIELD OUTPUT:
 
@@ -820,6 +820,7 @@ export function parseAndValidateRawAIResponse(
   const hasPlannedItems = Array.isArray(contract.plannedItems) && contract.plannedItems.length > 0;
   const plannedItemByIdMap = new Map((contract.plannedItems || []).map((p) => [p.id, p]));
   const plannedItemBySeqMap = new Map((contract.plannedItems || []).map((p) => [p.sequence, p]));
+  const plannedWrittenCoverageUnitIds = new Set((contract.plannedItems || []).map((p) => p.coverageUnitId));
   const fulfilledPlannedItemIds = new Set<string>();
   let writtenCandidateIndex = 0;
 
@@ -1656,6 +1657,15 @@ export function parseAndValidateRawAIResponse(
   // Verify Required Counts per Contract Unit (Count is Authoritative, NO Fake Data)
   const failedCoverageUnitIds: string[] = [];
   contract.units.forEach((cu) => {
+    if (
+      hasPlannedItems &&
+      cu.instrumentType === 'WRITTEN_TEST' &&
+      cu.allocationUnit === 'ITEM' &&
+      !plannedWrittenCoverageUnitIds.has(cu.coverageUnitId)
+    ) {
+      return;
+    }
+
     const generatedCount = generatedCountPerCoverage.get(cu.coverageUnitId) || 0;
     if (generatedCount < cu.requiredCount) {
       failedCoverageUnitIds.push(cu.coverageUnitId);
