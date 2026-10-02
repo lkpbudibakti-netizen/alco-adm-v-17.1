@@ -582,10 +582,28 @@ ATURAN GENERASI KETAT:
    B. ITEM — ORAL_TEST
    Gunakan field:
    - coverageUnitId: WAJIB.
-   - itemType: gunakan SHORT_ANSWER atau ESSAY.
+   - itemType: WAJIB, gunakan SHORT_ANSWER atau ESSAY.
    - prompt: WAJIB, berupa pertanyaan lisan.
-   - proposedAnswer: opsional sebagai respons yang diharapkan.
+   - proposedAnswer: WAJIB dengan answerType: "EXPECTED_RESPONSE", value (pokok/rambu jawaban atau respons yang diharapkan dari murid), dan explanation opsional.
+   - scoringGuideDraft: WAJIB dengan instructions (pedoman/kriteria penskoran jawaban lisan) dan maxScore (skor maksimal, misal 5, 10, atau 100).
+   JANGAN membuat tes lisan tanpa expected response dan pedoman penskoran.
    JANGAN mengubah tes lisan menjadi MULTIPLE_CHOICE kecuali kontrak/konteks secara eksplisit memerlukannya.
+
+   Contoh Tes Lisan Lengkap:
+   {
+     "coverageUnitId": "...",
+     "itemType": "SHORT_ANSWER",
+     "prompt": "Jelaskan perbedaan antara produsen dan konsumen dalam rantai makanan!",
+     "proposedAnswer": {
+       "answerType": "EXPECTED_RESPONSE",
+       "value": "Produsen dapat membuat makanan sendiri (seperti tumbuhan melalui fotosintesis), sedangkan konsumen mendapatkan energi dari makhluk hidup lain.",
+       "explanation": "Murid menjelaskan konsep pembuatan makanan sendiri vs mengonsumsi organisme lain."
+     },
+     "scoringGuideDraft": {
+       "instructions": "Skor 5 jika mampu menjelaskan kedua konsep secara tepat; skor 3 jika hanya menjelaskan salah satu; skor 1 jika berusaha menjawab namun kurang tepat; skor 0 jika tidak menjawab.",
+       "maxScore": 5
+     }
+   }
 
    C. ITEM — SELF_ASSESSMENT / PEER_ASSESSMENT
    Gunakan field:
@@ -612,26 +630,48 @@ ATURAN GENERASI KETAT:
    D. TASK — PERFORMANCE / ASSIGNMENT / PROJECT / PRODUCT
    Gunakan field:
    - coverageUnitId: WAJIB.
-   - taskPrompt: WAJIB, berupa instruksi tugas yang dapat dilakukan murid.
+   - taskPrompt: WAJIB, berupa instruksi tugas yang jelas untuk dilakukan murid.
+   - aspects: WAJIB minimal 1 aspek penilaian dengan field "label" (wajib) serta "description" atau "weight" (opsional).
+   - rubricDraft atau scoringGuideDraft: WAJIB minimal salah satu (sangat disarankan rubricDraft lengkap untuk penilaian kinerja/praktik).
    - taskTitle: opsional.
    - instructions: opsional.
    - expectedDeliverable: opsional.
-   - aspects: opsional, berupa array objek dengan field "label" dan dapat memiliki "description" atau "weight".
-   - rubricDraft: opsional.
-   - scoringGuideDraft: opsional.
 
-   Contoh:
+   Contoh Asesmen Performa Lengkap dengan Rubrik:
    {
      "coverageUnitId": "...",
-     "taskTitle": "Praktik Gerak Dasar",
-     "taskPrompt": "Lakukan rangkaian gerak sesuai instruksi guru.",
-     "instructions": "Lakukan secara tertib dan aman.",
+     "taskTitle": "Praktik Pengukuran Benda",
+     "taskPrompt": "Ukurlah panjang dan lebar tiga benda berbeda di dalam kelas menggunakan mistar/penggaris, lalu catat hasilnya pada tabel pengukuran.",
+     "instructions": "Lakukan pengukuran secara teliti dan catat satuan ukur dengan benar.",
      "aspects": [
        {
-         "label": "Ketepatan gerakan",
-         "description": "Gerakan sesuai contoh."
+         "label": "Keterampilan Penggunaan Alat Ukur",
+         "description": "Ketepatan menempatkan titik nol dan membaca skala mistar secara tegak lurus."
+       },
+       {
+         "label": "Ketepatan Pencatatan Data",
+         "description": "Kesesuaian hasil pengukuran beserta satuan ukur yang tepat."
        }
-     ]
+     ],
+     "rubricDraft": {
+       "title": "Rubrik Praktik Pengukuran",
+       "criteria": [
+         {
+           "label": "Keterampilan Menggunakan Alat Ukur",
+           "indicator": "Murid menyejajarkan titik nol dan membaca skala secara tegak lurus."
+         },
+         {
+           "label": "Ketepatan Pencatatan Data",
+           "indicator": "Murid mencatat angka dan satuan ukur secara lengkap dan benar."
+         }
+       ],
+       "scale": [
+         { "label": "Sangat Mahir", "score": 4, "descriptor": "Melakukan seluruh langkah pengukuran secara mandiri dan tepat." },
+         { "label": "Mahir", "score": 3, "descriptor": "Melakukan pengukuran dengan tepat namun membutuhkan sedikit arahan." },
+         { "label": "Cukup Mahir", "score": 2, "descriptor": "Terdapat beberapa kekeliruan dalam membaca atau mencatat skala." },
+         { "label": "Perlu Bimbingan", "score": 1, "descriptor": "Belum mampu membaca skala atau menggunakan alat ukur dengan benar." }
+       ]
+     }
    }
 
    JANGAN menggunakan field generik seperti:
@@ -1257,6 +1297,50 @@ export function parseAndValidateRawAIResponse(
           }
         }
 
+        // Evaluation Completeness Validation for ORAL_TEST Items
+        if (contractUnit.instrumentType === 'ORAL_TEST') {
+          let hasOralError = false;
+
+          const hasExpectedResponse =
+            typeof candidate.proposedAnswer?.value === 'string' &&
+            candidate.proposedAnswer.value.trim().length > 0;
+
+          if (!hasExpectedResponse) {
+            issues.push({
+              code: 'MISSING_ORAL_EXPECTED_RESPONSE',
+              severity: 'REVIEW',
+              message: `Kandidat ITEM #${idx + 1} (ORAL_TEST) wajib memiliki proposedAnswer.value sebagai jawaban yang diharapkan (expected response).`,
+              objectiveRefId: contractUnit.objectiveRefId,
+            });
+            hasOralError = true;
+          }
+
+          const hasScoringGuideInstructions =
+            candidate.scoringGuideDraft &&
+            typeof candidate.scoringGuideDraft.instructions === 'string' &&
+            candidate.scoringGuideDraft.instructions.trim().length > 0;
+
+          const hasValidMaxScore =
+            candidate.scoringGuideDraft &&
+            typeof candidate.scoringGuideDraft.maxScore === 'number' &&
+            Number.isFinite(candidate.scoringGuideDraft.maxScore) &&
+            candidate.scoringGuideDraft.maxScore > 0;
+
+          if (!hasScoringGuideInstructions || !hasValidMaxScore) {
+            issues.push({
+              code: 'MISSING_ORAL_SCORING_GUIDE',
+              severity: 'REVIEW',
+              message: `Kandidat ITEM #${idx + 1} (ORAL_TEST) wajib memiliki scoringGuideDraft dengan instruksi pedoman penskoran dan maxScore > 0.`,
+              objectiveRefId: contractUnit.objectiveRefId,
+            });
+            hasOralError = true;
+          }
+
+          if (hasOralError) {
+            return;
+          }
+        }
+
         const scoringGuideDraft =
           candidate.scoringGuideDraft && typeof candidate.scoringGuideDraft === 'object'
             ? {
@@ -1450,6 +1534,33 @@ export function parseAndValidateRawAIResponse(
                     : undefined,
               }
             : undefined;
+
+        // Evaluation Completeness Validation for PERFORMANCE Tasks
+        if (contractUnit.instrumentType === 'PERFORMANCE') {
+          const hasValidAspects = aspects && aspects.length > 0 && aspects.some((asp) => asp.label && asp.label.trim().length > 0);
+          if (!hasValidAspects) {
+            issues.push({
+              code: 'MISSING_PERFORMANCE_ASPECTS',
+              severity: 'REVIEW',
+              message: `Kandidat TASK #${idx + 1} (PERFORMANCE) wajib memiliki minimal 1 aspek penilaian dengan label yang jelas.`,
+              objectiveRefId: contractUnit.objectiveRefId,
+            });
+            return;
+          }
+
+          const hasRubric = rubricDraft && rubricDraft.criteria && rubricDraft.criteria.length > 0;
+          const hasScoringGuide = scoringGuideDraft && scoringGuideDraft.instructions && scoringGuideDraft.instructions.trim().length > 0;
+
+          if (!hasRubric && !hasScoringGuide) {
+            issues.push({
+              code: 'MISSING_PERFORMANCE_RUBRIC_OR_GUIDE',
+              severity: 'REVIEW',
+              message: `Kandidat TASK #${idx + 1} (PERFORMANCE) wajib dilengkapi rubrik (rubricDraft) atau pedoman penskoran (scoringGuideDraft) yang valid.`,
+              objectiveRefId: contractUnit.objectiveRefId,
+            });
+            return;
+          }
+        }
 
         const taskUnit: GeneratedTaskUnit = {
           allocationUnit: 'TASK',
