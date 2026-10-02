@@ -7,6 +7,21 @@ import {
 } from '../types';
 import { getPhaseForGrade } from '../data/curriculum/resolver';
 
+const ROMAN_GRADE_MAP: Record<string, number> = {
+  I: 1,
+  II: 2,
+  III: 3,
+  IV: 4,
+  V: 5,
+  VI: 6,
+  VII: 7,
+  VIII: 8,
+  IX: 9,
+  X: 10,
+  XI: 11,
+  XII: 12,
+};
+
 function parseGradeString(str: string): number | undefined {
   const trimmed = str.trim();
   if (!trimmed) return undefined;
@@ -16,12 +31,21 @@ function parseGradeString(str: string): number | undefined {
     return undefined;
   }
 
-  // Pola eksplisit: opsional prefix kata (kelas|kls|grade|tingkat), lalu angka integer 1..12 secara eksak
-  const match = trimmed.match(/^(?:(?:kelas|kls|grade|tingkat)\s+)?([1-9]|1[0-2])$/i);
-  if (match) {
-    const num = parseInt(match[1], 10);
+  // 1. Pola angka Arab: opsional prefix kata (kelas|kls|grade|tingkat), lalu angka integer 1..12 secara eksak
+  const arabicMatch = trimmed.match(/^(?:(?:kelas|kls|grade|tingkat)\s+)?([1-9]|1[0-2])$/i);
+  if (arabicMatch) {
+    const num = parseInt(arabicMatch[1], 10);
     if (!isNaN(num) && num >= 1 && num <= 12) {
       return num;
+    }
+  }
+
+  // 2. Pola angka Romawi: opsional prefix kata (kelas|kls|grade|tingkat), lalu angka Romawi I..XII secara eksak
+  const romanMatch = trimmed.match(/^(?:(?:kelas|kls|grade|tingkat)\s+)?(XII|XI|X|IX|VIII|VII|VI|V|IV|III|II|I)$/i);
+  if (romanMatch) {
+    const romanKey = romanMatch[1].toUpperCase();
+    if (romanKey in ROMAN_GRADE_MAP) {
+      return ROMAN_GRADE_MAP[romanKey];
     }
   }
 
