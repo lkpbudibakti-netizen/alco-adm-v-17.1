@@ -43,6 +43,35 @@ export function normalizeTransferCode(val: unknown): string {
 }
 
 /**
+ * Validates and normalizes schema version.
+ * Accepts only supported v1 versions: '1.0' and alias 'v1'.
+ * Returns canonical '1.0' or null if unsupported.
+ */
+export function normalizeSchemaVersion(val: unknown): typeof PROJECT_TRANSFER_SCHEMA_VERSION_V1 | null {
+  const norm = normalizeSingleLineText(val).toLowerCase();
+  if (norm === '1.0' || norm === 'v1') {
+    return PROJECT_TRANSFER_SCHEMA_VERSION_V1;
+  }
+  return null;
+}
+
+export const VALID_TRANSFER_EDUCATION_LEVELS = ['SD', 'SMP', 'SMA', 'SMK'] as const;
+export type TransferEducationLevel = (typeof VALID_TRANSFER_EDUCATION_LEVELS)[number];
+
+/**
+ * Validates and normalizes education level.
+ * Accepts only 'SD', 'SMP', 'SMA', 'SMK' (case-insensitive).
+ * Returns uppercase canonical string or null if invalid.
+ */
+export function normalizeEducationLevel(val: unknown): TransferEducationLevel | null {
+  const norm = normalizeSingleLineText(val).toUpperCase();
+  if (norm === 'SD' || norm === 'SMP' || norm === 'SMA' || norm === 'SMK') {
+    return norm;
+  }
+  return null;
+}
+
+/**
  * Validates and normalizes curriculum type.
  * Returns canonical CurriculumType or null if invalid.
  */
@@ -144,7 +173,28 @@ export function validateProjectTransfer(
   const raw = rawInput as RawProjectTransferPackage;
 
   // 1. PROJECT Header Validation
-  const schemaVersion = normalizeSingleLineText(raw.schemaVersion) || PROJECT_TRANSFER_SCHEMA_VERSION_V1;
+  const rawSchemaVersion = raw.schemaVersion;
+  const schemaVersionNorm = normalizeSingleLineText(rawSchemaVersion);
+  const validatedSchemaVersion = normalizeSchemaVersion(rawSchemaVersion);
+
+  if (!rawSchemaVersion || schemaVersionNorm === '') {
+    issues.push({
+      severity: 'ERROR',
+      code: 'MISSING_PROJECT_SCHEMA_VERSION',
+      message: 'Field schemaVersion wajib diisi.',
+      field: 'schemaVersion',
+      path: 'project.schemaVersion',
+    });
+  } else if (!validatedSchemaVersion) {
+    issues.push({
+      severity: 'ERROR',
+      code: 'UNSUPPORTED_SCHEMA_VERSION',
+      message: `Versi schema "${schemaVersionNorm}" tidak didukung. Contract saat ini hanya mendukung versi 1.0 (atau alias v1).`,
+      field: 'schemaVersion',
+      path: 'project.schemaVersion',
+    });
+  }
+
   const rawCurriculum = raw.curriculumType;
   const curriculumType = normalizeCurriculumType(rawCurriculum);
 
@@ -177,12 +227,23 @@ export function validateProjectTransfer(
     });
   }
 
-  const level = normalizeSingleLineText(raw.level).toUpperCase();
-  if (!level) {
+  const rawLevel = raw.level;
+  const levelNorm = normalizeSingleLineText(rawLevel).toUpperCase();
+  const validatedLevel = normalizeEducationLevel(rawLevel);
+
+  if (!rawLevel || levelNorm === '') {
     issues.push({
       severity: 'ERROR',
       code: 'MISSING_LEVEL',
       message: 'Field level (Jenjang Pendidikan) wajib diisi.',
+      field: 'level',
+      path: 'project.level',
+    });
+  } else if (!validatedLevel) {
+    issues.push({
+      severity: 'ERROR',
+      code: 'INVALID_EDUCATION_LEVEL',
+      message: `Jenjang pendidikan "${levelNorm}" tidak valid. Hanya mendukung SD, SMP, SMA, atau SMK.`,
       field: 'level',
       path: 'project.level',
     });
@@ -512,10 +573,10 @@ export function validateProjectTransfer(
 
   const validatedPackage: ProjectTransferPackage | undefined = isValid
     ? {
-        schemaVersion,
+        schemaVersion: validatedSchemaVersion || PROJECT_TRANSFER_SCHEMA_VERSION_V1,
         curriculumType: curriculumType!,
         subject,
-        level,
+        level: validatedLevel || 'SD',
         grade,
         phase,
         academicYear,
