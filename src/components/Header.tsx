@@ -1,5 +1,5 @@
 import React from 'react';
-import { BookOpen, Database, UserCheck, Wifi, WifiOff, FolderPlus, Layers, Plus, Building2 } from 'lucide-react';
+import { BookOpen, Database, UserCheck, Wifi, WifiOff, FolderPlus, Layers, Plus, Building2, FileSpreadsheet } from 'lucide-react';
 import { TeacherProfile, SchoolData, AdministrationWorkspace } from '../types';
 import { AdministrationWorkspaceV5 } from '../types/storageV5';
 import { PWAInstallButton } from './PWAInstallButton';
@@ -14,6 +14,7 @@ interface HeaderProps {
   onSelectProfile: (id: string) => void;
   onSelectWorkspace: (id: string) => void;
   onCreateWorkspaceClick: () => void;
+  onImportProjectClick?: () => void;
   onOpenBackupModal: () => void;
 }
 
@@ -26,6 +27,7 @@ export const Header: React.FC<HeaderProps> = ({
   onSelectProfile,
   onSelectWorkspace,
   onCreateWorkspaceClick,
+  onImportProjectClick,
   onOpenBackupModal,
 }) => {
   const isOnline = useOnlineStatus();
@@ -147,6 +149,22 @@ export const Header: React.FC<HeaderProps> = ({
               >
                 <Plus className="w-3.5 h-3.5" />
               </button>
+              {onImportProjectClick && (
+                <button
+                  id="btn-header-import-workspace"
+                  type="button"
+                  onClick={onImportProjectClick}
+                  disabled={!activeProfile}
+                  className={`p-1 rounded-lg text-white text-xs transition-colors shrink-0 shadow-xs ${
+                    activeProfile
+                      ? 'bg-emerald-600 hover:bg-emerald-700 cursor-pointer'
+                      : 'bg-slate-300 cursor-not-allowed opacity-50'
+                  }`}
+                  title={activeProfile ? "Import Project Administrasi dari Excel (.xlsx)" : "Buat profil guru terlebih dahulu"}
+                >
+                  <FileSpreadsheet className="w-3.5 h-3.5" />
+                </button>
+              )}
             </div>
 
             {/* Backup / Restore */}

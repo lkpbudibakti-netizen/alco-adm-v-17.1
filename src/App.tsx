@@ -83,9 +83,10 @@ import { SemesterSelector } from './components/SemesterSelector';
 import { K13Manager } from './components/administration/K13Manager';
 import { AdministrationHub } from './components/administration/AdministrationHub';
 import { BackupModal } from './components/BackupModal';
+import { ProjectTransferImportModal } from './components/ProjectTransferImportModal';
 import { isK13, getCurriculumTypeFromSetting } from './services/curriculumRouter';
 import { validateAcademicSettingReadiness } from './services/academicSettingReadiness';
-import { Plus, Copy, Trash2, X, FolderPlus, AlertCircle } from 'lucide-react';
+import { Plus, Copy, Trash2, X, FolderPlus, AlertCircle, FileSpreadsheet } from 'lucide-react';
 import { GRADE_PHASE_MAP, SUBJECT_OPTIONS } from './data/curriculumDefaults';
 import { APP_BUILD_ID } from './config/buildInfo';
 
@@ -109,6 +110,7 @@ export function App() {
   const [currentStep, setCurrentStep] = useState<WorkflowStepId>('profile');
   const [isBackupModalOpen, setIsBackupModalOpen] = useState(false);
   const [isNewWorkspaceModalOpen, setIsNewWorkspaceModalOpen] = useState(false);
+  const [isImportProjectModalOpen, setIsImportProjectModalOpen] = useState(false);
   const [appNotice, setAppNotice] = useState<{ type: 'error' | 'warning' | 'info'; message: string } | null>(null);
 
   // New Workspace form state (Canonical Merdeka Annual Hierarchy - No Semester)
@@ -1150,6 +1152,7 @@ export function App() {
         onSelectProfile={handleSelectProfile}
         onSelectWorkspace={handleSelectWorkspace}
         onCreateWorkspaceClick={openNewWorkspaceModal}
+        onImportProjectClick={() => setIsImportProjectModalOpen(true)}
         onOpenBackupModal={() => setIsBackupModalOpen(true)}
       />
 
@@ -1211,6 +1214,7 @@ export function App() {
               workspaces={workspacesForActiveProfile || []}
               yearPlans={yearPlansForActiveProfile || []}
               onCreateWorkspaceClick={openNewWorkspaceModal}
+              onImportProjectClick={() => setIsImportProjectModalOpen(true)}
               onSelectProfile={handleSelectProfile}
               onSaveProfile={handleSaveProfile}
               onDeleteProfile={handleDeleteProfile}
@@ -1572,20 +1576,33 @@ export function App() {
                 </p>
               </div>
 
-              <div className="flex items-center justify-end gap-2 pt-3 border-t border-slate-100">
+              <div className="flex items-center justify-between pt-3 border-t border-slate-100 flex-wrap gap-2">
                 <button
                   type="button"
-                  onClick={() => setIsNewWorkspaceModalOpen(false)}
-                  className="px-4 py-2 rounded-xl text-sm font-medium text-slate-600 hover:bg-slate-100 transition cursor-pointer"
+                  onClick={() => {
+                    setIsNewWorkspaceModalOpen(false);
+                    setIsImportProjectModalOpen(true);
+                  }}
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-semibold text-emerald-700 hover:text-emerald-800 hover:bg-emerald-50 border border-emerald-200 transition cursor-pointer"
                 >
-                  Batal
+                  <FileSpreadsheet className="w-3.5 h-3.5" />
+                  <span>Import dari XLSX</span>
                 </button>
-                <button
-                  type="submit"
-                  className="px-5 py-2 rounded-xl text-sm font-semibold text-white bg-blue-900 hover:bg-blue-950 shadow-sm transition cursor-pointer"
-                >
-                  Buat Administrasi Baru
-                </button>
+                <div className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={() => setIsNewWorkspaceModalOpen(false)}
+                    className="px-4 py-2 rounded-xl text-sm font-medium text-slate-600 hover:bg-slate-100 transition cursor-pointer"
+                  >
+                    Batal
+                  </button>
+                  <button
+                    type="submit"
+                    className="px-5 py-2 rounded-xl text-sm font-semibold text-white bg-blue-900 hover:bg-blue-950 shadow-sm transition cursor-pointer"
+                  >
+                    Buat Administrasi Baru
+                  </button>
+                </div>
               </div>
             </form>
           </div>
@@ -1597,6 +1614,22 @@ export function App() {
         isOpen={isBackupModalOpen}
         onClose={() => setIsBackupModalOpen(false)}
         onDataRestored={refreshV5}
+      />
+
+      {/* Project Transfer Import Modal (.xlsx) */}
+      <ProjectTransferImportModal
+        isOpen={isImportProjectModalOpen}
+        onClose={() => setIsImportProjectModalOpen(false)}
+        activeProfile={activeProfile}
+        activeSchool={activeSchoolForView}
+        onSuccess={() => {
+          refreshV5();
+          setCurrentStep('academic');
+          setAppNotice({
+            type: 'info',
+            message: 'Project Administrasi baru berhasil diimpor dan sekarang aktif.',
+          });
+        }}
       />
     </div>
   );

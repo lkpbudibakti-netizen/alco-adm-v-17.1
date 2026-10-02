@@ -19,6 +19,7 @@ import {
   History,
   AlertTriangle,
   FolderPlus,
+  FileSpreadsheet,
 } from 'lucide-react';
 import { TeacherProfile, SchoolData, PrincipalHistory, AdministrationWorkspace, YearPlan } from '../types';
 import { AdministrationWorkspaceV5 } from '../types/storageV5';
@@ -35,6 +36,7 @@ interface ProfileManagerProps {
   workspaces?: AdministrationWorkspaceV5[];
   yearPlans?: YearPlan[];
   onCreateWorkspaceClick?: () => void;
+  onImportProjectClick?: () => void;
   onSelectProfile: (id: string) => void;
   onSaveProfile: (profile: TeacherProfile, isCreate?: boolean) => boolean | void;
   onDeleteProfile: (id: string) => void;
@@ -57,6 +59,7 @@ export const ProfileManager: React.FC<ProfileManagerProps> = ({
   workspaces = [],
   yearPlans = [],
   onCreateWorkspaceClick,
+  onImportProjectClick,
   onSelectProfile,
   onSaveProfile,
   onDeleteProfile,
@@ -984,26 +987,44 @@ export const ProfileManager: React.FC<ProfileManagerProps> = ({
             </p>
           </div>
 
-          <button
-            id="btn-create-annual-workspace"
-            type="button"
-            onClick={onCreateWorkspaceClick}
-            disabled={!activeProfile}
-            className={`inline-flex items-center gap-2 px-4 py-2.5 rounded-xl text-xs font-bold shadow-xs transition cursor-pointer self-start sm:self-auto ${
-              activeProfile
-                ? 'bg-blue-900 hover:bg-blue-950 text-white'
-                : 'bg-slate-200 text-slate-400 cursor-not-allowed'
-            }`}
-          >
-            <Plus className="w-4 h-4" />
-            <span>Tambah Administrasi Tahunan</span>
-          </button>
+          <div className="flex items-center gap-2 self-start sm:self-auto flex-wrap">
+            {onImportProjectClick && (
+              <button
+                id="btn-import-annual-workspace"
+                type="button"
+                onClick={onImportProjectClick}
+                disabled={!activeProfile}
+                className={`inline-flex items-center gap-1.5 px-3.5 py-2.5 rounded-xl text-xs font-bold border border-emerald-300 bg-emerald-50 text-emerald-800 hover:bg-emerald-100 shadow-xs transition cursor-pointer ${
+                  activeProfile ? '' : 'opacity-50 cursor-not-allowed'
+                }`}
+                title="Import project dari file Excel (.xlsx)"
+              >
+                <FileSpreadsheet className="w-4 h-4 text-emerald-700" />
+                <span>Import Project (.xlsx)</span>
+              </button>
+            )}
+
+            <button
+              id="btn-create-annual-workspace"
+              type="button"
+              onClick={onCreateWorkspaceClick}
+              disabled={!activeProfile}
+              className={`inline-flex items-center gap-2 px-4 py-2.5 rounded-xl text-xs font-bold shadow-xs transition cursor-pointer ${
+                activeProfile
+                  ? 'bg-blue-900 hover:bg-blue-950 text-white'
+                  : 'bg-slate-200 text-slate-400 cursor-not-allowed'
+              }`}
+            >
+              <Plus className="w-4 h-4" />
+              <span>Tambah Administrasi Tahunan</span>
+            </button>
+          </div>
         </div>
 
         {workspaces.length === 0 ? (
           <div
             id="empty-workspaces-banner"
-            className="bg-slate-50/70 rounded-2xl p-8 border-2 border-dashed border-slate-200 text-center space-y-3"
+            className="bg-slate-50/70 rounded-2xl p-8 border-2 border-dashed border-slate-200 text-center space-y-4"
           >
             <div className="w-12 h-12 rounded-xl bg-blue-50 text-blue-700 mx-auto flex items-center justify-center">
               <FolderPlus className="w-6 h-6" />
@@ -1011,8 +1032,30 @@ export const ProfileManager: React.FC<ProfileManagerProps> = ({
             <div className="max-w-md mx-auto space-y-1">
               <h5 className="font-bold text-slate-800 text-sm">Belum Ada Administrasi Tahunan</h5>
               <p className="text-xs text-slate-500">
-                Klik tombol di atas untuk membuat administrasi tahunan baru bagi profil guru ini.
+                Buat administrasi tahunan baru atau impor langsung dari file Excel (.xlsx) untuk profil guru ini.
               </p>
+            </div>
+            <div className="flex items-center justify-center gap-3 pt-1 flex-wrap">
+              <button
+                type="button"
+                onClick={onCreateWorkspaceClick}
+                disabled={!activeProfile}
+                className="inline-flex items-center gap-2 px-4 py-2 rounded-xl text-xs font-bold bg-blue-900 hover:bg-blue-950 text-white shadow-xs transition cursor-pointer"
+              >
+                <Plus className="w-4 h-4" />
+                <span>Tambah Administrasi Manual</span>
+              </button>
+              {onImportProjectClick && (
+                <button
+                  type="button"
+                  onClick={onImportProjectClick}
+                  disabled={!activeProfile}
+                  className="inline-flex items-center gap-2 px-4 py-2 rounded-xl text-xs font-bold border border-emerald-300 bg-emerald-50 text-emerald-800 hover:bg-emerald-100 shadow-xs transition cursor-pointer"
+                >
+                  <FileSpreadsheet className="w-4 h-4 text-emerald-700" />
+                  <span>Import dari XLSX</span>
+                </button>
+              )}
             </div>
           </div>
         ) : (
