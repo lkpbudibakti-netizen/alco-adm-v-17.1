@@ -139,6 +139,7 @@ export const AssessmentPackageBuilder: React.FC<AssessmentPackageBuilderProps> =
   const [isExportingPdf, setIsExportingPdf] = useState<boolean>(false);
   const [validationReport, setValidationReport] = useState<any>(null);
   const [generationError, setGenerationError] = useState<string | null>(null);
+  const [isFullRegenerateConfirmOpen, setIsFullRegenerateConfirmOpen] = useState<boolean>(false);
 
   const selectedPlan = assessmentPlans.find((p) => p.id === selectedPlanId);
   const activePackage = assessmentPackages.find((pkg) => pkg.assessmentPlanId === selectedPlanId);
@@ -824,7 +825,17 @@ export const AssessmentPackageBuilder: React.FC<AssessmentPackageBuilderProps> =
         </div>
 
         {activePackage && (
-          <div className="flex items-center gap-3">
+          <div className="flex items-center gap-3 flex-wrap">
+            <button
+              type="button"
+              onClick={() => setIsFullRegenerateConfirmOpen(true)}
+              disabled={isGenerating || isRegenerating || isValidating}
+              className="px-3.5 py-1.5 bg-amber-50 hover:bg-amber-100 text-amber-800 border border-amber-300 rounded-lg text-xs font-semibold flex items-center gap-1.5 transition shadow-2xs disabled:opacity-50"
+              title="Rebuild seluruh perangkat asesmen berdasarkan Rencana Asesmen terbaru"
+            >
+              <Sparkles className="w-3.5 h-3.5 text-amber-600" />
+              Generate Ulang Seluruh Paket
+            </button>
             <span
               className={`px-3 py-1 rounded-full text-xs font-bold tracking-wide uppercase ${
                 activePackage.workflowStatus === 'SIAP'
@@ -851,7 +862,15 @@ export const AssessmentPackageBuilder: React.FC<AssessmentPackageBuilderProps> =
       )}
 
       {/* UI State Driven Layouts */}
-      {uiState === 'NO_PLAN' ? (
+      {isGenerating || uiState === 'GENERATING' ? (
+        <div className="bg-white rounded-xl border border-slate-200 p-12 text-center max-w-xl mx-auto space-y-4 shadow-sm">
+          <RefreshCw className="w-10 h-10 text-blue-600 animate-spin mx-auto" />
+          <h4 className="text-lg font-bold text-slate-800">Menyusun Perangkat Asesmen...</h4>
+          <p className="text-slate-600 text-sm max-w-xs mx-auto">
+            AI sedang merumuskan indikator asesmen, merancang draf soal instrumen, dan memetakan rubrik kriteria penilaian berdasarkan rencana Anda. Proses ini membutuhkan beberapa detik.
+          </p>
+        </div>
+      ) : uiState === 'NO_PLAN' ? (
         <div className="bg-white rounded-xl border border-slate-200 p-8 text-center max-w-xl mx-auto shadow-sm">
           <BookOpen className="w-12 h-12 text-slate-400 mx-auto mb-3" />
           <h4 className="text-lg font-bold text-slate-800 mb-2">Pilih Rencana Asesmen</h4>
@@ -1186,6 +1205,27 @@ export const AssessmentPackageBuilder: React.FC<AssessmentPackageBuilderProps> =
                       </span>
                     ))}
                   </div>
+                </div>
+
+                <div className="bg-slate-50 p-4 rounded-xl border border-slate-200 flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+                  <div className="space-y-1">
+                    <div className="flex items-center gap-2">
+                      <Sparkles className="w-4 h-4 text-amber-600" />
+                      <h5 className="text-xs font-bold text-slate-800 uppercase tracking-wide">Pembaruan & Regenerasi Paket</h5>
+                    </div>
+                    <p className="text-xs text-slate-600">
+                      Jika Rencana Asesmen telah diubah (misal target jumlah soal atau TP), Anda dapat men-generate ulang seluruh paket secara terpadu.
+                    </p>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => setIsFullRegenerateConfirmOpen(true)}
+                    disabled={isGenerating || isRegenerating || isValidating}
+                    className="px-4 py-2 bg-amber-50 hover:bg-amber-100 text-amber-800 border border-amber-300 rounded-lg text-xs font-bold flex items-center justify-center gap-1.5 transition shadow-2xs whitespace-nowrap self-start sm:self-auto disabled:opacity-50"
+                  >
+                    <Sparkles className="w-3.5 h-3.5 text-amber-600" />
+                    Generate Ulang Seluruh Paket
+                  </button>
                 </div>
               </div>
             )}
@@ -3681,6 +3721,64 @@ export const AssessmentPackageBuilder: React.FC<AssessmentPackageBuilderProps> =
                 )}
               </div>
             )}
+          </div>
+        </div>
+      </div>
+    )}
+
+    {/* Modal Konfirmasi Generate Ulang Seluruh Paket */}
+    {isFullRegenerateConfirmOpen && (
+      <div className="fixed inset-0 bg-slate-900/50 backdrop-blur-xs flex items-center justify-center p-4 z-50 animate-fadeIn">
+        <div className="bg-white rounded-2xl shadow-xl max-w-lg w-full p-6 space-y-5 border border-slate-200">
+          <div className="flex items-start gap-3.5">
+            <div className="w-10 h-10 rounded-full bg-amber-100 flex items-center justify-center text-amber-600 flex-shrink-0">
+              <AlertTriangle className="w-5 h-5" />
+            </div>
+            <div className="space-y-1">
+              <h3 className="text-lg font-bold text-slate-900">
+                Generate Ulang Seluruh Paket Asesmen?
+              </h3>
+              <p className="text-xs text-slate-500">
+                Rencana Asesmen: <strong>{selectedPlan?.displayLabel || selectedPlan?.title}</strong>
+              </p>
+            </div>
+          </div>
+
+          <div className="bg-amber-50 border border-amber-200 rounded-xl p-4 text-xs text-amber-900 space-y-2">
+            <p className="font-semibold">Konfirmasi Penggantian Paket:</p>
+            <ul className="list-disc pl-4 space-y-1.5 text-amber-800">
+              <li>
+                Seluruh isi perangkat asesmen (kisi-kisi, instrumen, kunci jawaban, dan rubrik) akan <strong>diganti secara menyeluruh</strong> berdasarkan target Rencana Asesmen terbaru.
+              </li>
+              <li>
+                Perubahan atau penyesuaian manual yang pernah dilakukan pada paket saat ini dapat <strong>hilang</strong>.
+              </li>
+              <li>
+                Jika proses generasi gagal atau dibatalkan, <strong>paket lama akan tetap tersimpan aman</strong> tanpa perubahan.
+              </li>
+            </ul>
+          </div>
+
+          <div className="flex items-center justify-end gap-3 pt-2">
+            <button
+              type="button"
+              onClick={() => setIsFullRegenerateConfirmOpen(false)}
+              className="px-4 py-2 text-slate-700 hover:bg-slate-100 rounded-lg text-xs font-semibold transition"
+            >
+              Batal
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                setIsFullRegenerateConfirmOpen(false);
+                handleAutoGeneratePackage();
+              }}
+              disabled={isGenerating}
+              className="px-4 py-2 bg-amber-600 hover:bg-amber-700 text-white rounded-lg text-xs font-bold flex items-center gap-1.5 shadow transition"
+            >
+              <Sparkles className="w-3.5 h-3.5" />
+              Ya, Generate Ulang Seluruh Paket
+            </button>
           </div>
         </div>
       </div>
