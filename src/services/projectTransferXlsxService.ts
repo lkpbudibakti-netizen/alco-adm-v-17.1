@@ -37,35 +37,82 @@ function cleanCellVal(val: unknown): string | number | undefined {
 }
 
 /**
- * Finds a worksheet in the workbook by exact sheet name, then fallback by keywords.
+ * Resolves a sheet name for a specific transfer kind ('PROJECT' | 'CP' | 'TP' | 'ATP')
+ * using canonical names first, then case/separator normalization, then unambiguous meaningful aliases.
+ * Strictly avoids matching generic numeric tokens ('01', '02', '03', '04').
+ */
+export function matchTransferSheetName(
+  sheetNames: string[],
+  kind: 'PROJECT' | 'CP' | 'TP' | 'ATP'
+): string | undefined {
+  const canonicalMap: Record<'PROJECT' | 'CP' | 'TP' | 'ATP', string> = {
+    PROJECT: PROJECT_TRANSFER_XLSX_SHEETS.PROJECT,
+    CP: PROJECT_TRANSFER_XLSX_SHEETS.CP,
+    TP: PROJECT_TRANSFER_XLSX_SHEETS.TP,
+    ATP: PROJECT_TRANSFER_XLSX_SHEETS.ATP,
+  };
+
+  const canonicalName = canonicalMap[kind];
+
+  // 1. Exact canonical match (e.g. '01_PROJECT')
+  if (sheetNames.includes(canonicalName)) {
+    return canonicalName;
+  }
+
+  // 2. Case-insensitive exact match
+  const lowerCanonical = canonicalName.toLowerCase();
+  const caseInsensitiveMatch = sheetNames.find(
+    (name) => name.trim().toLowerCase() === lowerCanonical
+  );
+  if (caseInsensitiveMatch) {
+    return caseInsensitiveMatch;
+  }
+
+  // 3. Separator-normalized canonical match (e.g. '01-PROJECT', '01 PROJECT', '01.PROJECT')
+  const strippedCanonical = lowerCanonical.replace(/[^a-z0-9]/g, '');
+  const strippedMatch = sheetNames.find(
+    (name) => name.toLowerCase().replace(/[^a-z0-9]/g, '') === strippedCanonical
+  );
+  if (strippedMatch) {
+    return strippedMatch;
+  }
+
+  // 4. Meaningful name alias match (strictly disambiguated, no generic numbers)
+  const isMatchForAlias = (name: string): boolean => {
+    const raw = name.toLowerCase().trim();
+    const tokens = raw.split(/[^a-z0-9]+/).filter(Boolean);
+
+    switch (kind) {
+      case 'PROJECT':
+        return tokens.includes('project') || raw.includes('project');
+
+      case 'CP':
+        if (tokens.includes('atp') || raw.includes('atp') || raw.includes('project')) return false;
+        return tokens.includes('cp') || raw.includes('capaian');
+
+      case 'ATP':
+        return tokens.includes('atp') || raw.includes('alur');
+
+      case 'TP':
+        if (tokens.includes('atp') || raw.includes('atp') || tokens.includes('cp')) return false;
+        return tokens.includes('tp') || raw.includes('tujuan');
+    }
+  };
+
+  return sheetNames.find(isMatchForAlias);
+}
+
+/**
+ * Finds a worksheet in the workbook by transfer kind.
  */
 function findSheet(
   workbook: XLSX.WorkBook,
-  exactName: string,
-  keywords: string[]
+  kind: 'PROJECT' | 'CP' | 'TP' | 'ATP'
 ): XLSX.WorkSheet | undefined {
-  // 1. Exact match
-  if (workbook.Sheets[exactName]) {
-    return workbook.Sheets[exactName];
+  const matchedName = matchTransferSheetName(workbook.SheetNames, kind);
+  if (matchedName && workbook.Sheets[matchedName]) {
+    return workbook.Sheets[matchedName];
   }
-
-  // 2. Case-insensitive match
-  const lowerExact = exactName.toLowerCase();
-  const matchedSheetName = workbook.SheetNames.find(
-    (name) => name.trim().toLowerCase() === lowerExact
-  );
-  if (matchedSheetName && workbook.Sheets[matchedSheetName]) {
-    return workbook.Sheets[matchedSheetName];
-  }
-
-  // 3. Keyword-based fallback
-  for (const name of workbook.SheetNames) {
-    const lowerName = name.toLowerCase();
-    if (keywords.some((kw) => lowerName.includes(kw))) {
-      return workbook.Sheets[name];
-    }
-  }
-
   return undefined;
 }
 
@@ -327,14 +374,10 @@ function parseATPSheet(sheet?: XLSX.WorkSheet): RawProjectTransferPackage['atp']
 export function parseWorkbookToRawProjectTransfer(
   workbook: XLSX.WorkBook
 ): RawProjectTransferPackage {
-  const sheetProject = findSheet(
-    workbook,
-    PROJECT_TRANSFER_XLSX_SHEETS.PROJECT,
-    ['project', '01']
-  );
-  const sheetCP = findSheet(workbook, PROJECT_TRANSFER_XLSX_SHEETS.CP, ['cp', '02']);
-  const sheetTP = findSheet(workbook, PROJECT_TRANSFER_XLSX_SHEETS.TP, ['tp', '03']);
-  const sheetATP = findSheet(workbook, PROJECT_TRANSFER_XLSX_SHEETS.ATP, ['atp', '04']);
+  const sheetProject = findSheet(workbook, 'PROJECT');
+  const sheetCP = findSheet(workbook, 'CP');
+  const sheetTP = findSheet(workbook, 'TP');
+  const sheetATP = findSheet(workbook, 'ATP');
 
   const projectHeader = parseProjectSheet(sheetProject);
   const cp = parseCPSheet(sheetCP);
