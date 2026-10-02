@@ -1603,3 +1603,4 @@ export * from './assessmentRegeneration';
 export * from './assessmentExport';
 export * from './storageV5';
 export * from './projectTransfer';
+export * from './administrationProjectTransfer';
