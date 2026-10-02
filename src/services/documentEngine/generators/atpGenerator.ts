@@ -11,6 +11,7 @@ import {
 } from 'docx';
 import saveAs from 'file-saver';
 import { DocumentGenerationContext, GeneratedDocumentResult } from '../types';
+import { resolveAtpItemAnnualJP } from '../../learningPlanService';
 import {
   createDocumentHeader,
   createIdentityMetadataTable,
@@ -70,6 +71,10 @@ export async function generateATP(context: DocumentGenerationContext): Promise<G
     ],
   });
 
+  const allocationSource = context.protaSemesterAllocations?.length
+    ? context.protaSemesterAllocations
+    : context.timeAllocations;
+
   // Table Data Rows
   const tableDataRows = (atp?.items || []).map((item, index) => {
     const p3List = item.p3Dimensions && item.p3Dimensions.length > 0 ? item.p3Dimensions.join(', ') : '-';
@@ -80,8 +85,8 @@ export async function generateATP(context: DocumentGenerationContext): Promise<G
       .filter(Boolean)
       .join('\n');
 
-    const itJp = item.allocatedJP ?? item.jp;
-    const itJpDisplay = itJp != null ? `${itJp} JP` : '—';
+    const resolvedJp = resolveAtpItemAnnualJP(item, allocationSource);
+    const itJpDisplay = resolvedJp != null ? `${resolvedJp} JP` : '—';
 
     return new TableRow({
       children: [
@@ -109,12 +114,16 @@ export async function generateATP(context: DocumentGenerationContext): Promise<G
 
   // Total JP Row
   const items = atp?.items || [];
-  const knownJPItems = items.filter(
-    (item) => (item.allocatedJP ?? item.jp) != null
+  const resolvedItems = items.map((item) => ({
+    item,
+    resolvedJp: resolveAtpItemAnnualJP(item, allocationSource),
+  }));
+  const knownJPItems = resolvedItems.filter(
+    (r) => r.resolvedJp != null
   );
   const unknownJPCount = items.length - knownJPItems.length;
   const knownTotalJP = knownJPItems.reduce(
-    (sum, item) => sum + Number(item.allocatedJP ?? item.jp ?? 0),
+    (sum, r) => sum + (r.resolvedJp ?? 0),
     0
   );
 

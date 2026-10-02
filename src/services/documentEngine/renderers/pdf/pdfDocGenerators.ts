@@ -16,6 +16,7 @@ import { buildPromesProjection, buildAlokasiWaktuProjection } from '../../promes
 import { buildProtaProjection, buildK13ProtaProjection } from '../../protaProjection';
 import { buildModulAjarProjection } from '../../modulAjarProjection';
 import { buildK13AlokasiWaktuRows } from '../../k13AlokasiWaktuHelper';
+import { resolveAtpItemAnnualJP } from '../../../learningPlanService';
 
 export async function generatePdfDocument(
   type: DocumentType,
@@ -215,12 +216,20 @@ export async function generatePdfDocument(
     case 'ATP': {
       title = 'Alur Tujuan Pembelajaran (ATP)';
       const atpItemsList = atp?.items || [];
-      const knownJPItems = atpItemsList.filter(
-        (item) => (item.allocatedJP ?? item.jp) != null
+      const allocationSource = context.protaSemesterAllocations?.length
+        ? context.protaSemesterAllocations
+        : context.timeAllocations;
+
+      const resolvedItems = atpItemsList.map((item) => ({
+        item,
+        resolvedJp: resolveAtpItemAnnualJP(item, allocationSource),
+      }));
+      const knownJPItems = resolvedItems.filter(
+        (r) => r.resolvedJp != null
       );
       const unknownJPCount = atpItemsList.length - knownJPItems.length;
       const knownTotalJP = knownJPItems.reduce(
-        (sum, item) => sum + Number(item.allocatedJP ?? item.jp ?? 0),
+        (sum, r) => sum + (r.resolvedJp ?? 0),
         0
       );
 
@@ -270,8 +279,8 @@ export async function generatePdfDocument(
             '....................',
           ])
         : atpItemsList.map((it, idx) => {
-            const itJp = it.allocatedJP ?? it.jp;
-            const itJpDisplay = itJp != null ? `${itJp} JP` : '—';
+            const resolvedJp = resolveAtpItemAnnualJP(it, allocationSource);
+            const itJpDisplay = resolvedJp != null ? `${resolvedJp} JP` : '—';
             return [
               it.stepNumber || idx + 1,
               it.tpCode || `TP ${idx + 1}`,

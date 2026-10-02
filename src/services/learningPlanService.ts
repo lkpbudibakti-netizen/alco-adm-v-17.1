@@ -124,6 +124,73 @@ export function resolveAtpItemSemesterJP(
   return total > 0 ? total : null;
 }
 
+export interface SemesterAllocationBundleLike {
+  allocations: TimeAllocation[];
+  semester?: 1 | 2 | number;
+  semesterPlanId?: string;
+}
+
+/**
+ * Resolves canonical annual JP for an ATP item across available semester allocations or TimeAllocation collections.
+ * Ignores ASSESSMENT and RESERVE allocations.
+ * Accepts ATP_ITEM source only.
+ * Sums positive allocatedJP (fallback to positive jp) across matched TimeAllocation records.
+ * Deduplicates TimeAllocation records by ID.
+ * Returns null when unresolved.
+ * Never falls back to legacy ATPItem.allocatedJP or ATPItem.jp.
+ */
+export function resolveAtpItemAnnualJP(
+  atpItem: ATPItem,
+  allocationSource?: (TimeAllocation | SemesterAllocationBundleLike)[] | TimeAllocation[] | SemesterAllocationBundleLike[] | null
+): number | null {
+  if (!atpItem || !allocationSource || allocationSource.length === 0) return null;
+
+  // Flatten allocations from either semester allocation bundles or direct TimeAllocation arrays
+  const rawAllocations: TimeAllocation[] = [];
+  for (const entry of allocationSource) {
+    if (!entry) continue;
+    if ('allocations' in entry && Array.isArray((entry as SemesterAllocationBundleLike).allocations)) {
+      rawAllocations.push(...(entry as SemesterAllocationBundleLike).allocations);
+    } else if ('sourceId' in entry || 'allocatedJP' in entry || 'jp' in entry || 'id' in entry) {
+      rawAllocations.push(entry as TimeAllocation);
+    }
+  }
+
+  if (rawAllocations.length === 0) return null;
+
+  // Avoid duplicate allocation records by ID
+  const seenIds = new Set<string>();
+  const uniqueAllocations: TimeAllocation[] = [];
+  for (const alloc of rawAllocations) {
+    if (alloc.id) {
+      if (seenIds.has(alloc.id)) continue;
+      seenIds.add(alloc.id);
+    }
+    uniqueAllocations.push(alloc);
+  }
+
+  const matches = uniqueAllocations.filter((ta) => {
+    if (ta.sourceType === 'ASSESSMENT' || ta.sourceType === 'RESERVE') return false;
+    const isExact = ta.sourceId === atpItem.id || ta.atpItemId === atpItem.id;
+    if (!isExact) return false;
+    if (ta.sourceType === 'ATP_ITEM' || !ta.sourceType) return true;
+    return false;
+  });
+
+  if (matches.length === 0) return null;
+
+  const total = matches.reduce((sum, ta) => {
+    const val = typeof ta.allocatedJP === 'number' && ta.allocatedJP > 0
+      ? ta.allocatedJP
+      : typeof ta.jp === 'number' && ta.jp > 0
+      ? ta.jp
+      : 0;
+    return sum + val;
+  }, 0);
+
+  return total > 0 ? total : null;
+}
+
 /**
  * Resolves semester JP for a direct TP allocation strictly from active semester TimeAllocation records.
  * Ignores ASSESSMENT and RESERVE allocations.
