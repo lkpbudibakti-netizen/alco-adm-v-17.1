@@ -23,6 +23,8 @@ const SUPPORTED_SCHEMA_VERSIONS = new Set<string>([
   ADMINISTRATION_PROJECT_PACKAGE_SCHEMA_VERSION_V1,
 ]);
 
+const SUPPORTED_EDUCATION_LEVELS = new Set(['SD', 'SMP', 'SMA', 'SMK']);
+
 const FORBIDDEN_PORTABLE_FIELD_NAMES = new Set([
   'TeacherProfile',
   'SchoolData',
@@ -215,6 +217,14 @@ function validateHeader(
       path: 'header.curriculumType',
     });
   }
+
+  if (!SUPPORTED_EDUCATION_LEVELS.has(pkg.header.level)) {
+    error({
+      code: 'HEADER_LEVEL_INVALID',
+      message: `Header.level [${String(pkg.header.level)}] tidak valid. Gunakan SD, SMP, SMA, atau SMK.`,
+      path: 'header.level',
+    });
+  }
 }
 
 function validateRootCollections(
@@ -334,6 +344,10 @@ function validateSemesterReferences(
     assessmentPlanIds: Set<string>;
   }
 ): void {
+  const semesterCriterionIds = collectEntityIds(semesterData.assessmentCriteria);
+  const semesterLearningPlanIds = collectEntityIds(semesterData.learningPlans);
+  const semesterAssessmentPlanIds = collectEntityIds(semesterData.assessmentPlans);
+
   asArray(semesterData.assessmentCriteria).forEach((criterion, index) => {
     requireReference(criterion.tpId, context.tpItemIds, context.error, {
       code: 'DANGLING_KKTP_TP_REFERENCE',
@@ -354,9 +368,9 @@ function validateSemesterReferences(
       message: 'LearningPlan.atpItemIds berisi referensi ATPItem yang tidak resolve.',
       path: `${planPath}.atpItemIds`,
     });
-    validateReferences(plan.kktpCriterionIds, context.criterionIds, context.error, {
+    validateReferences(plan.kktpCriterionIds, semesterCriterionIds, context.error, {
       code: 'DANGLING_LEARNING_PLAN_KKTP_REFERENCE',
-      message: 'LearningPlan.kktpCriterionIds berisi referensi KKTP yang tidak resolve.',
+      message: 'LearningPlan.kktpCriterionIds berisi referensi KKTP yang tidak resolve di semester yang sama.',
       path: `${planPath}.kktpCriterionIds`,
     });
     asArray(plan.objectives).forEach((objective, objectiveIndex) => {
@@ -398,20 +412,24 @@ function validateSemesterReferences(
       message: 'AssessmentPlan.tpIds berisi referensi TP yang tidak resolve.',
       path: `${planPath}.tpIds`,
     });
-    validateReferences(plan.criterionIds, context.criterionIds, context.error, {
+    validateReferences(plan.criterionIds, semesterCriterionIds, context.error, {
       code: 'DANGLING_ASSESSMENT_PLAN_CRITERION_REFERENCE',
-      message: 'AssessmentPlan.criterionIds berisi referensi KKTP yang tidak resolve.',
+      message: 'AssessmentPlan.criterionIds berisi referensi KKTP yang tidak resolve di semester yang sama.',
       path: `${planPath}.criterionIds`,
     });
-    validateReferences(plan.learningPlanIds, context.learningPlanIds, context.error, {
+    validateReferences(plan.learningPlanIds, semesterLearningPlanIds, context.error, {
       code: 'DANGLING_ASSESSMENT_PLAN_LEARNING_PLAN_REFERENCE',
-      message: 'AssessmentPlan.learningPlanIds berisi referensi LearningPlan yang tidak resolve.',
+      message: 'AssessmentPlan.learningPlanIds berisi referensi LearningPlan yang tidak resolve di semester yang sama.',
       path: `${planPath}.learningPlanIds`,
     });
   });
 
   asArray(semesterData.assessmentPackages).forEach((assessmentPackage, index) => {
-    validateAssessmentPackageReferences(assessmentPackage, `${path}.assessmentPackages[${index}]`, context);
+    validateAssessmentPackageReferences(assessmentPackage, `${path}.assessmentPackages[${index}]`, {
+      ...context,
+      criterionIds: semesterCriterionIds,
+      assessmentPlanIds: semesterAssessmentPlanIds,
+    });
   });
 
   if (semesterData.semester !== 1 && semesterData.semester !== 2) {
@@ -442,6 +460,7 @@ function validateAssessmentPackageReferences(
   const blueprintIds = new Set<string>();
   const instrumentIds = new Set<string>();
   const instrumentItemIds = new Set<string>();
+  const instrumentItemOwnerById = new Map<string, string>();
   const rubricIds = new Set<string>();
   const scoringGuideIds = new Set<string>();
   const optionIdsByItemId = new Map<string, Set<string>>();
@@ -526,6 +545,7 @@ function validateAssessmentPackageReferences(
       });
 
       if (!itemId) return;
+      instrumentItemOwnerById.set(itemId, instrument.id);
       optionIdsByItemId.set(itemId, collectIds(item.options));
       matchingPremiseIdsByItemId.set(itemId, collectIds(item.matchingPremises));
       matchingResponseIdsByItemId.set(itemId, collectIds(item.matchingResponses));
@@ -560,12 +580,22 @@ function validateAssessmentPackageReferences(
       message: 'AssessmentBlueprintItem.instrumentItemIds berisi referensi instrumentItem.id yang tidak resolve.',
       path: `${path}.blueprintItems[${index}].instrumentItemIds`,
     });
+    if (item.instrumentId) {
+      asArray(item.instrumentItemIds).forEach((instrumentItemId, itemIndex) => {
+        validateInstrumentItemOwnership(item.instrumentId, instrumentItemId, instrumentItemOwnerById, context.error, {
+          code: 'BLUEPRINT_INSTRUMENT_ITEM_OWNER_MISMATCH',
+          message: `AssessmentBlueprintItem.instrumentItemIds[${itemIndex}] bukan milik instrumentId [${item.instrumentId}].`,
+          path: `${path}.blueprintItems[${index}].instrumentItemIds[${itemIndex}]`,
+        });
+      });
+    }
   });
 
   validateAssessmentPackageSupportReferences(assessmentPackage, path, {
     error: context.error,
     instrumentIds,
     instrumentItemIds,
+    instrumentItemOwnerById,
     optionIdsByItemId,
     matchingPremiseIdsByItemId,
     matchingResponseIdsByItemId,
@@ -581,6 +611,7 @@ function validateAssessmentPackageSupportReferences(
     error: (issue: IssueInput) => void;
     instrumentIds: Set<string>;
     instrumentItemIds: Set<string>;
+    instrumentItemOwnerById: Map<string, string>;
     optionIdsByItemId: Map<string, Set<string>>;
     matchingPremiseIdsByItemId: Map<string, Set<string>>;
     matchingResponseIdsByItemId: Map<string, Set<string>>;
@@ -598,6 +629,11 @@ function validateAssessmentPackageSupportReferences(
     requireReference(answerKey.instrumentItemId, context.instrumentItemIds, context.error, {
       code: 'DANGLING_ANSWER_KEY_INSTRUMENT_ITEM_REFERENCE',
       message: `AssessmentAnswerKey.instrumentItemId [${String(answerKey.instrumentItemId)}] tidak resolve ke instrumentItem.id.`,
+      path: `${keyPath}.instrumentItemId`,
+    });
+    validateInstrumentItemOwnership(answerKey.instrumentId, answerKey.instrumentItemId, context.instrumentItemOwnerById, context.error, {
+      code: 'ANSWER_KEY_INSTRUMENT_ITEM_OWNER_MISMATCH',
+      message: `AssessmentAnswerKey.instrumentItemId [${String(answerKey.instrumentItemId)}] bukan milik instrumentId [${String(answerKey.instrumentId)}].`,
       path: `${keyPath}.instrumentItemId`,
     });
     validateReferences(answerKey.optionIds, context.optionIdsByItemId.get(answerKey.instrumentItemId) ?? new Set(), context.error, {
@@ -643,6 +679,11 @@ function validateAssessmentPackageSupportReferences(
       message: `AssessmentRubric.instrumentItemId tidak resolve ke instrumentItem.id.`,
       path: `${rubricPath}.instrumentItemId`,
     });
+    validateInstrumentItemOwnership(rubric.instrumentId, rubric.instrumentItemId, context.instrumentItemOwnerById, context.error, {
+      code: 'RUBRIC_INSTRUMENT_ITEM_OWNER_MISMATCH',
+      message: `AssessmentRubric.instrumentItemId [${String(rubric.instrumentItemId)}] bukan milik instrumentId [${String(rubric.instrumentId)}].`,
+      path: `${rubricPath}.instrumentItemId`,
+    });
   });
 
   asArray(assessmentPackage.scoringGuides).forEach((guide, index) => {
@@ -655,6 +696,11 @@ function validateAssessmentPackageSupportReferences(
     validateOptionalLocalReference(guide.instrumentItemId, context.instrumentItemIds, context.error, {
       code: 'DANGLING_SCORING_GUIDE_ITEM_REFERENCE',
       message: `AssessmentScoringGuide.instrumentItemId tidak resolve ke instrumentItem.id.`,
+      path: `${guidePath}.instrumentItemId`,
+    });
+    validateInstrumentItemOwnership(guide.instrumentId, guide.instrumentItemId, context.instrumentItemOwnerById, context.error, {
+      code: 'SCORING_GUIDE_INSTRUMENT_ITEM_OWNER_MISMATCH',
+      message: `AssessmentScoringGuide.instrumentItemId [${String(guide.instrumentItemId)}] bukan milik instrumentId [${String(guide.instrumentId)}].`,
       path: `${guidePath}.instrumentItemId`,
     });
   });
@@ -749,6 +795,36 @@ function collectIds(value: unknown): Set<string> {
     }
   });
   return ids;
+}
+
+function collectEntityIds(values: Array<{ id?: string }> | undefined | null): Set<string> {
+  const ids = new Set<string>();
+  asArray(values).forEach((value) => {
+    if (isPresent(value.id)) {
+      ids.add(value.id);
+    }
+  });
+  return ids;
+}
+
+function validateInstrumentItemOwnership(
+  instrumentId: unknown,
+  instrumentItemId: unknown,
+  instrumentItemOwnerById: Map<string, string>,
+  error: (issue: IssueInput) => void,
+  options: {
+    code: string;
+    message: string;
+    path: string;
+  }
+): void {
+  if (!isPresent(instrumentId) || !isPresent(instrumentItemId)) return;
+  const ownerInstrumentId = instrumentItemOwnerById.get(instrumentItemId);
+  if (!ownerInstrumentId || ownerInstrumentId === instrumentId) return;
+  error({
+    ...options,
+    refId: instrumentItemId,
+  });
 }
 
 function buildResult(issues: AdministrationProjectTransferIssue[]): AdministrationProjectTransferValidationResult {

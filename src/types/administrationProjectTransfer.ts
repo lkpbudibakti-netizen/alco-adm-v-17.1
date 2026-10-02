@@ -36,7 +36,7 @@ export interface AdministrationProjectPackageHeader {
   curriculumType: CurriculumType;
   academicYear: string;
   subject: string;
-  level: 'SD' | 'SMP' | 'SMA' | 'SMK' | string;
+  level: 'SD' | 'SMP' | 'SMA' | 'SMK';
   grade: string;
   phase: string;
   classSection?: string;
