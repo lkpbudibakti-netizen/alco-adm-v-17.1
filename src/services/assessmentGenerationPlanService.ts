@@ -534,10 +534,12 @@ export function resolveAssessmentGenerationPlan(
     }
   }
 
-  // 5. Hitung Alokasi Semantik & Evaluasi Alokasi Guru vs Minimum ITEM Coverage
-  const itemUnits = coverageUnits.filter((u) => u.allocationUnit === 'ITEM');
-  const minItemCoverageCount = itemUnits.length;
-  let finalAllocatedCount = minItemCoverageCount;
+  // 5. Hitung Alokasi Semantik & Evaluasi Alokasi Guru vs Minimum WRITTEN_TEST ITEM Coverage
+  const writtenItemUnits = coverageUnits.filter(
+    (u) => u.allocationUnit === 'ITEM' && u.instrumentType === 'WRITTEN_TEST'
+  );
+  const minWrittenItemCoverageCount = writtenItemUnits.length;
+  let finalAllocatedCount = minWrittenItemCoverageCount;
 
   const isRequestedTotalItemsValid = requestedTotalItems !== undefined &&
     typeof requestedTotalItems === 'number' &&
@@ -545,26 +547,26 @@ export function resolveAssessmentGenerationPlan(
     Number.isInteger(requestedTotalItems) &&
     requestedTotalItems > 0;
 
-  if (isRequestedTotalItemsValid && itemUnits.length > 0) {
+  if (isRequestedTotalItemsValid && writtenItemUnits.length > 0) {
     finalAllocatedCount = requestedTotalItems;
     const N = requestedTotalItems;
-    const M = itemUnits.length;
+    const M = writtenItemUnits.length;
 
-    if (N < minItemCoverageCount) {
+    if (N < minWrittenItemCoverageCount) {
       planIssues.push({
         code: 'TEACHER_ITEM_COUNT_UNDER_COVERAGE',
         severity: 'REVIEW',
-        message: `Jumlah butir yang diminta (${N}) lebih kecil dari jumlah cakupan semantik ITEM (${minItemCoverageCount}). Jumlah permintaan guru dipertahankan; sebagian target cakupan semantik belum mendapat plannedItem.`,
+        message: `Jumlah butir tes tertulis yang diminta (${N}) lebih kecil dari jumlah cakupan semantik WRITTEN_TEST ITEM (${minWrittenItemCoverageCount}). Jumlah permintaan guru dipertahankan; sebagian target cakupan semantik belum mendapat plannedItem.`,
       });
-      itemUnits.forEach((u) => {
+      writtenItemUnits.forEach((u) => {
         u.recommendedCount = 1;
       });
     } else {
-      if (N > minItemCoverageCount) {
+      if (N > minWrittenItemCoverageCount) {
         planIssues.push({
           code: 'EXTRA_ITEM_ALLOCATION_REQUIRES_REVIEW',
           severity: 'REVIEW',
-          message: `Alokasi tambahan (${N - minItemCoverageCount} butir) di atas cakupan minimal butir memerlukan telaah atau penentuan distribusi oleh guru.`,
+          message: `Alokasi tambahan (${N - minWrittenItemCoverageCount} butir) di atas cakupan minimal butir tes tertulis memerlukan telaah atau penentuan distribusi oleh guru.`,
         });
       }
       // Largest Remainder / Hamilton method for N >= M
@@ -575,7 +577,7 @@ export function resolveAssessmentGenerationPlan(
       const deficit = N - sumBaseQuotas;
 
       // Sort deterministically by remainder descending, tie-break by ID ascending
-      const indexedUnits = itemUnits.map((u, idx) => ({ u, idx, id: u.id, remainder }));
+      const indexedUnits = writtenItemUnits.map((u, idx) => ({ u, idx, id: u.id, remainder }));
       indexedUnits.sort((a, b) => {
         if (b.remainder !== a.remainder) return b.remainder - a.remainder;
         return a.id.localeCompare(b.id);
@@ -583,7 +585,7 @@ export function resolveAssessmentGenerationPlan(
 
       const bonusSet = new Set(indexedUnits.slice(0, deficit).map((item) => item.u.id));
 
-      itemUnits.forEach((u) => {
+      writtenItemUnits.forEach((u) => {
         u.recommendedCount = baseQuota + (bonusSet.has(u.id) ? 1 : 0);
       });
     }
@@ -595,7 +597,7 @@ export function resolveAssessmentGenerationPlan(
     : 0;
   const plannedItems: AssessmentPlannedItem[] = [];
 
-  if (resolvedConstraints.itemTypeDistribution && itemUnits.length > 0) {
+  if (resolvedConstraints.itemTypeDistribution && writtenItemUnits.length > 0) {
     const itemTypeSum = Object.values(resolvedConstraints.itemTypeDistribution).reduce((sum, val) => sum + (val || 0), 0);
     if (itemTypeSum !== N_total) {
       planIssues.push({
@@ -606,7 +608,7 @@ export function resolveAssessmentGenerationPlan(
     }
   }
 
-  if (resolvedConstraints.difficultyDistribution && itemUnits.length > 0) {
+  if (resolvedConstraints.difficultyDistribution && writtenItemUnits.length > 0) {
     const diffSum = Object.values(resolvedConstraints.difficultyDistribution).reduce((sum, val) => sum + (val || 0), 0);
     if (diffSum !== N_total) {
       planIssues.push({
@@ -617,7 +619,7 @@ export function resolveAssessmentGenerationPlan(
     }
   }
 
-  if (resolvedConstraints.cognitiveDistribution && itemUnits.length > 0) {
+  if (resolvedConstraints.cognitiveDistribution && writtenItemUnits.length > 0) {
     const cogSum = Object.values(resolvedConstraints.cognitiveDistribution).reduce((sum, val) => sum + (val || 0), 0);
     if (cogSum !== N_total) {
       planIssues.push({
@@ -628,9 +630,9 @@ export function resolveAssessmentGenerationPlan(
     }
   }
 
-  if (itemUnits.length > 0 && N_total >= 0) {
+  if (writtenItemUnits.length > 0 && N_total >= 0) {
     const plannedCoverageUnitIds: string[] = [];
-    const sortedItemUnits = [...itemUnits].sort((a, b) => a.id.localeCompare(b.id));
+    const sortedItemUnits = [...writtenItemUnits].sort((a, b) => a.id.localeCompare(b.id));
     if (isRequestedTotalItemsValid && N_total < sortedItemUnits.length) {
       for (let i = 0; i < N_total; i++) {
         plannedCoverageUnitIds.push(sortedItemUnits[i].id);
@@ -699,7 +701,7 @@ export function resolveAssessmentGenerationPlan(
       // If no explicit difficulty distribution requested, use whatever is on the coverage unit (no defaults!)
       for (let i = 0; i < N_total; i++) {
         const uId = plannedCoverageUnitIds[i];
-        const u = itemUnits.find((unit) => unit.id === uId);
+        const u = writtenItemUnits.find((unit) => unit.id === uId);
         plannedDifficulties.push(u?.difficultyTarget);
       }
     }
@@ -724,7 +726,7 @@ export function resolveAssessmentGenerationPlan(
       // If no explicit cognitive distribution requested, use whatever is on the coverage unit (no defaults!)
       for (let i = 0; i < N_total; i++) {
         const uId = plannedCoverageUnitIds[i];
-        const u = itemUnits.find((unit) => unit.id === uId);
+        const u = writtenItemUnits.find((unit) => unit.id === uId);
         plannedCognitives.push(u?.cognitiveDemand);
       }
     }
@@ -746,7 +748,7 @@ export function resolveAssessmentGenerationPlan(
 
     // Update u.difficultyTarget and u.cognitiveDemand with the first item's targets as representatives
     // ONLY update if they are defined (to preserve undefined status in Case T & Case U when no constraints requested)
-    itemUnits.forEach((u) => {
+    writtenItemUnits.forEach((u) => {
       const firstItem = plannedItems.find((item) => item.coverageUnitId === u.id);
       if (firstItem) {
         if (firstItem.difficultyTarget !== undefined) {
@@ -768,7 +770,9 @@ export function resolveAssessmentGenerationPlan(
   for (const u of coverageUnits) {
     switch (u.allocationUnit) {
       case 'ITEM':
-        itemCount += plannedItems.length > 0 ? 0 : (u.recommendedCount ?? 1);
+        if (u.instrumentType !== 'WRITTEN_TEST' || plannedItems.length === 0) {
+          itemCount += u.recommendedCount ?? 1;
+        }
         break;
       case 'TASK':
         taskCount += u.recommendedCount ?? 1;
@@ -785,7 +789,7 @@ export function resolveAssessmentGenerationPlan(
     }
   }
   if (plannedItems.length > 0) {
-    itemCount = plannedItems.length;
+    itemCount += plannedItems.length;
   }
 
   // 6. Evaluasi Status Final Plan

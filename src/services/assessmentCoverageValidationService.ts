@@ -48,6 +48,7 @@ export function validateAssessmentCoverage(
   for (const planUnit of generationPlan.coverageUnits) {
     const isUnallocatedSemanticItemUnit =
       planUnit.allocationUnit === 'ITEM' &&
+      planUnit.instrumentType === 'WRITTEN_TEST' &&
       plannedItemCoverageCounts.size > 0 &&
       !plannedItemCoverageCounts.has(planUnit.id);
 
@@ -178,7 +179,9 @@ export function validateAssessmentCoverage(
     // FIX 2: Check planned count vs actual count ONLY if recommendedCount is defined
     if (planUnit.recommendedCount !== undefined) {
       const expectedCount =
-        planUnit.allocationUnit === 'ITEM' && plannedItemCoverageCounts.has(planUnit.id)
+        planUnit.allocationUnit === 'ITEM' &&
+        planUnit.instrumentType === 'WRITTEN_TEST' &&
+        plannedItemCoverageCounts.has(planUnit.id)
           ? plannedItemCoverageCounts.get(planUnit.id)!
           : planUnit.recommendedCount;
       let actualCount = 0;

@@ -425,7 +425,10 @@ export function buildGenerationContract(
   const units: AssessmentGenerationContractUnit[] = [];
 
   for (const cov of plan.coverageUnits) {
-    if (cov.allocationUnit === 'ITEM' && hasPlannedItems) {
+    const isWrittenItemCoverage =
+      cov.instrumentType === 'WRITTEN_TEST' && cov.allocationUnit === 'ITEM';
+
+    if (isWrittenItemCoverage && hasPlannedItems) {
       const allocatedCount = plannedCoverageUnitCounts.get(cov.id) || 0;
       if (allocatedCount === 0) {
         continue;
@@ -461,7 +464,7 @@ export function buildGenerationContract(
       : undefined;
 
     const requiredCount =
-      cov.allocationUnit === 'ITEM' && hasPlannedItems
+      isWrittenItemCoverage && hasPlannedItems
         ? (plannedCoverageUnitCounts.get(cov.id) || 1)
         : (cov.recommendedCount || 1);
 
@@ -520,7 +523,7 @@ ATURAN GENERASI KETAT:
    - JANGAN mengubah jumlah butir/tugas (requiredCount). Hasilkan PERSIS sesuai requiredCount.
    - JANGAN mengklaim konten sintetis buatan AI sebagai dokumen resmi (OFFICIAL) atau regulasi pemerintah.
    - JANGAN menandai draf sebagai SIAP atau FINAL (seluruh keluaran adalah DRAFT).
-   - UNTUK TES TERTULIS (WRITTEN_TEST): Rencana butir soal (plannedItems) bersifat AUTHORITATIVE. Setiap plannedItem menentukan TEPAT: sequence, coverageUnitId, itemType, cognitiveDemand, dan difficultyTarget. AI DILARANG menentukan ulang atau mengacak distribusi bentuk soal / kognitif / kesulitan. AI WAJIB menghasilkan 1 item untuk setiap plannedItem persis sesuai targetnya. Coverage unit ITEM tanpa plannedItem adalah target cakupan semantik, BUKAN perintah membuat butir fisik.
+   - UNTUK TES TERTULIS (WRITTEN_TEST): Rencana butir soal (plannedItems) bersifat AUTHORITATIVE. Setiap plannedItem menentukan TEPAT: sequence, coverageUnitId, itemType, cognitiveDemand, dan difficultyTarget. AI DILARANG menentukan ulang atau mengacak distribusi bentuk soal / kognitif / kesulitan. AI WAJIB menghasilkan 1 item untuk setiap plannedItem persis sesuai targetnya. Coverage unit WRITTEN_TEST ITEM tanpa plannedItem adalah target cakupan semantik, BUKAN perintah membuat butir fisik.
 
 2. SEMANTIK ALOKASI & KONTRAK FIELD OUTPUT:
 
@@ -1006,7 +1009,11 @@ export function parseAndValidateRawAIResponse(
         }
 
         let matchedPlannedItem: AssessmentPlannedItem | undefined;
-        if (hasPlannedItems && contractUnit.instrumentType === 'WRITTEN_TEST') {
+        if (
+          hasPlannedItems &&
+          contractUnit.instrumentType === 'WRITTEN_TEST' &&
+          contractUnit.allocationUnit === 'ITEM'
+        ) {
           writtenCandidateIndex++;
           if (candidate.plannedItemId && plannedItemByIdMap.has(candidate.plannedItemId)) {
             matchedPlannedItem = plannedItemByIdMap.get(candidate.plannedItemId);
@@ -2665,7 +2672,11 @@ export function mapGeneratedUnitsToAssessmentPackage(
       // Generate individual blueprint items per instrument item to preserve item-level target accuracy
       itemIds.forEach((itemId, subIdx) => {
         let plannedItem: any = undefined;
-        if (contract.plannedItems) {
+        if (
+          contract.plannedItems &&
+          cu.instrumentType === 'WRITTEN_TEST' &&
+          cu.allocationUnit === 'ITEM'
+        ) {
           const matchingPlannedItems = contract.plannedItems.filter((p) => p.coverageUnitId === cu.coverageUnitId);
           if (subIdx < matchingPlannedItems.length) {
             plannedItem = matchingPlannedItems[subIdx];
