@@ -2865,7 +2865,7 @@ export const TimePlanningManager: React.FC<TimePlanningManagerProps> = ({
                               {item.tpStatement || item.competency}
                             </div>
                             <div className="text-[11px] text-slate-500 mt-0.5">
-                              Lingkup Materi: {item.contentScope || item.subMaterial || '-'}
+                              Lingkup Materi: {item.materialScope || item.contentScope || item.subMaterial || '-'}
                             </div>
                           </td>
                           <td className="py-2.5 px-3 text-center">

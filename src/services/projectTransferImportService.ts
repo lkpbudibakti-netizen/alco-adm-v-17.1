@@ -287,6 +287,7 @@ export function performImportProjectTransferInState(
       materialScope: (a.material || matchedTPItem.contentScope || '').trim(),
       allocatedJP: jpVal,
       jp: jpVal,
+      semester: a.semester === 1 || a.semester === 2 ? a.semester : null,
       provenance: {
         generatedBy: 'USER',
         generatedAt: now,

@@ -1224,8 +1224,9 @@ export interface AutoAllocationResult {
 
 /**
  * Partisi Deterministik ATP Tahunan Antar Semester berdasarkan Proporsi Kapasitas (S1 & S2)
+ * Jika seluruh item memiliki semester hint (1 atau 2), partisi menggunakan hint tersebut.
  */
-export function partitionAnnualATP<T extends { stepNumber?: number }>(
+export function partitionAnnualATP<T extends { stepNumber?: number; semester?: any }>(
   annualATPItems: T[],
   s1AvailableJP: number,
   s2AvailableJP: number
@@ -1252,6 +1253,25 @@ export function partitionAnnualATP<T extends { stepNumber?: number }>(
 
   const s1Share = s1Cap / totalCapacity;
   const s2Share = s2Cap / totalCapacity;
+
+  // Cek apakah SELURUH item memiliki hint semester valid (1 atau 2)
+  const allHaveValidSemesterHint =
+    totalItems > 0 &&
+    sortedItems.every(
+      (item) => item.semester === 1 || item.semester === 2
+    );
+
+  if (allHaveValidSemesterHint) {
+    const s1Items = sortedItems.filter((item) => item.semester === 1);
+    const s2Items = sortedItems.filter((item) => item.semester === 2);
+
+    return {
+      s1Items,
+      s2Items,
+      s1Share,
+      s2Share,
+    };
+  }
 
   let s1Count = Math.round(totalItems * s1Share);
 

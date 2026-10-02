@@ -24,7 +24,7 @@ import {
 } from '../types/projectTransfer';
 import {
   readXlsxToRawProjectTransferPackage,
-  exportEmptyProjectTransferXlsxTemplateBuffer,
+  createEmptyProjectTransferXlsxTemplateBuffer,
 } from '../services/projectTransferXlsxService';
 import { validateProjectTransfer } from '../services/projectTransferService';
 import { importProjectTransferPackageV5 } from '../services/projectTransferImportService';
@@ -119,7 +119,7 @@ export const ProjectTransferImportModal: React.FC<ProjectTransferImportModalProp
 
   const handleDownloadTemplate = () => {
     try {
-      const buffer = exportEmptyProjectTransferXlsxTemplateBuffer({
+      const buffer = createEmptyProjectTransferXlsxTemplateBuffer({
         subject: 'Pendidikan Pancasila',
         level: (activeProfile?.defaultLevel || 'SD') as 'SD' | 'SMP' | 'SMA' | 'SMK',
         grade: 'Kelas 4',
